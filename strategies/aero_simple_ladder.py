@@ -6,20 +6,28 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import time
 import logging
 import uuid
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_EVEN
 from utils import format_by_increment
 
 logger = logging.getLogger("StrategyLogic")
 
 PORTFOLIO_CONFIG = {
     "4f8c51ed-720a-47a4-b1a7-d1a7ffd54a85": Decimal("0.1"), 
-    "ec4c59b8-3960-4bad-b474-46cbbf7b2dba": Decimal("1.0"),               
+    "ec4c59b8-3960-4bad-b474-46cbbf7b2dba": Decimal("1.0"),                
 }
 
 PRICE_INCREMENT = Decimal("0.00006")
 LEVELS = 50
 STP_NAMESPACE = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
 MAX_QUEUE_PER_TICK = 10 
+
+# --- Grid Snap Resolution ---
+ANCHOR_RESOLUTION = Decimal("0.002")
+
+def snap_to_anchor(price: Decimal, anchor: Decimal) -> Decimal:
+    """Rounds the raw market price to the nearest stable grid anchor."""
+    if anchor <= Decimal("0"): return price
+    return (price / anchor).quantize(Decimal("1"), rounding=ROUND_HALF_EVEN) * anchor
 
 def run_strategy(order_manager, market_data):
     portfolio_id = market_data.get("portfolio_id")
@@ -46,8 +54,12 @@ def run_strategy(order_manager, market_data):
         
     try:
         raw_price = market_data.get("price") or market_data.get("current_price")
-        mid_price = Decimal(str(raw_price))
-        if mid_price <= 0: return
+        raw_mid = Decimal(str(raw_price))
+        if raw_mid <= 0: return
+        
+        # --- GRID SNAP (Price Anchoring) ---
+        mid_price = snap_to_anchor(raw_mid, ANCHOR_RESOLUTION)
+        
         aero_bal = Decimal(str(market_data.get("aero_bal", "0")))
         usdc_bal = Decimal(str(market_data.get("usdc_bal", "0")))
     except Exception: return
@@ -55,9 +67,7 @@ def run_strategy(order_manager, market_data):
     active_orders = list(order_manager.active_orders.values())
     pending_queue = list(order_manager.execution_queue)
 
-    # --- CRITICAL FIX: Dynamic Spread Spacing to prevent Post-Only rejections ---
-    # Force the closest order to be at least 8 ticks away from the live mid-price
-    safety_offset = PRICE_INCREMENT * 8
+    safety_offset = PRICE_INCREMENT * 20 # Increased safety offset
     highest_buy_price = mid_price - safety_offset
     lowest_sell_price = mid_price + safety_offset
     
@@ -77,6 +87,7 @@ def run_strategy(order_manager, market_data):
 
     cancels_queued = 0
     for order in active_orders:
+        if cancels_queued >= 50: break # Guard against queue flood
         if order.get("portfolio_id") != portfolio_id: continue
             
         oprice_str = str(format_by_increment(Decimal(str(order.get("price", "0"))), Decimal("0.00001")))

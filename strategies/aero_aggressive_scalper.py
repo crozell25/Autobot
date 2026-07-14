@@ -1,0 +1,147 @@
+# strategies/aero_aggressive_scalper.py
+import uuid
+import logging
+from decimal import Decimal, ROUND_HALF_EVEN
+from utils import format_by_increment
+
+logger = logging.getLogger("AggressiveScalper")
+
+# Constants
+SELL_SIZE = Decimal("0.1")
+BUY_SIZE = Decimal("0.1")
+MAX_SELL_ORDERS = 100
+MAX_BUY_ORDERS = 20
+STALE_THRESHOLD_PCT = Decimal("0.01") # 1%
+STP_NAMESPACE = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+
+# --- Grid Snap Resolution ---
+ANCHOR_RESOLUTION = Decimal("0.002")
+
+def snap_to_anchor(price: Decimal, anchor: Decimal) -> Decimal:
+    """Rounds the raw market price to the nearest stable grid anchor."""
+    if anchor <= Decimal("0"): return price
+    return (price / anchor).quantize(Decimal("1"), rounding=ROUND_HALF_EVEN) * anchor
+
+def run_strategy(order_manager, market_data):
+    try:
+        portfolio_id = market_data.get("portfolio_id")
+        product_id = market_data.get("product_id", "AERO-USDC")
+        raw_mid = Decimal(str(market_data.get("price", "0")))
+        tick_size = Decimal(str(market_data.get("tick_size", "0.00001")))
+        best_ask = market_data.get("best_ask")
+
+        if not portfolio_id or raw_mid <= 0:
+            return
+
+        # --- 1. GRID SNAP (Price Anchoring) ---
+        # The bot will now ignore all micro-fluctuations inside the 0.002 boundary.
+        mid_price = snap_to_anchor(raw_mid, ANCHOR_RESOLUTION)
+
+        # Build active orders for this portfolio/product
+        active_orders = [
+            o for o in order_manager.active_orders.values()
+            if o.get("portfolio_id") == portfolio_id and o.get("product_id") == product_id
+        ]
+
+        sell_orders = [o for o in active_orders if o.get("side") == "SELL"]
+        buy_orders = [o for o in active_orders if o.get("side") == "BUY"]
+
+        # --- 2. Emergency Batch Cancellation Guard ---
+        if len(sell_orders) > MAX_SELL_ORDERS:
+            logger.warning("[%s] SELL limit exceeded (%d). Pruning up to 50.", portfolio_id[:8], len(sell_orders))
+            for o in sell_orders[:50]: # INCREASED FROM 5 TO 50
+                order_manager.enqueue({
+                    "action": "CANCEL_ORDER",
+                    "source_pid": portfolio_id,
+                    "client_order_id": o.get("client_order_id"),
+                    "exchange_id": o.get("exchange_id"),
+                    "product_id": product_id
+                })
+            return # Yield to let the queue drain
+
+        # --- 3. Prune Stale Orders (Both Sides) ---
+        stale_cancel_count = 0
+        for order in active_orders:
+            if stale_cancel_count >= 20: 
+                break # Don't flood the queue with routine maintenance
+            try:
+                o_price = Decimal(str(order.get("price", "0")))
+            except Exception:
+                continue
+                
+            dist = abs(o_price - mid_price) / mid_price
+            if dist > STALE_THRESHOLD_PCT:
+                order_manager.enqueue({
+                    "action": "CANCEL_ORDER",
+                    "source_pid": portfolio_id,
+                    "client_order_id": order.get("client_order_id"),
+                    "exchange_id": order.get("exchange_id"),
+                    "product_id": product_id
+                })
+                stale_cancel_count += 1
+
+        # Recompute fresh orders after pruning calculation
+        fresh_sell_orders = [
+            o for o in sell_orders
+            if abs(Decimal(str(o.get("price", "0"))) - mid_price) / mid_price <= STALE_THRESHOLD_PCT
+        ]
+        fresh_buy_orders = [
+            o for o in buy_orders
+            if abs(Decimal(str(o.get("price", "0"))) - mid_price) / mid_price <= STALE_THRESHOLD_PCT
+        ]
+
+        # --- 4. Manage Aggressive Taker Buy ---
+        if len(fresh_buy_orders) < MAX_BUY_ORDERS and best_ask:
+            taker_price = Decimal(str(best_ask)) + tick_size
+            formatted_price = format_by_increment(taker_price, tick_size)
+            
+            already = any(
+                str(o.get("price")) == formatted_price and o.get("side") == "BUY"
+                for o in active_orders
+            )
+            
+            if not already:
+                temp_client_id = str(uuid.uuid4())
+                order_manager.register_active_order(temp_client_id, {
+                    "client_order_id": temp_client_id,
+                    "portfolio_id": portfolio_id, "product_id": product_id,
+                    "side": "BUY", "price": formatted_price, "status": "PENDING"
+                })
+                order_manager.enqueue({
+                    "action": "PLACE_ORDER",
+                    "source_pid": portfolio_id,
+                    "client_order_id": temp_client_id,
+                    "product_id": product_id,
+                    "side": "BUY",
+                    "price": str(formatted_price),
+                    "size": str(BUY_SIZE),
+                    "post_only": False,
+                    "stp_id": str(uuid.uuid4())
+                })
+
+        # --- 5. Manage Sell Ladder (Maker) ---
+        if len(fresh_sell_orders) < 20:
+            target_price = mid_price * Decimal("1.001") # 0.1% above anchored mid
+            formatted_price = format_by_increment(target_price, tick_size)
+            client_order_id = str(uuid.uuid5(STP_NAMESPACE, f"{portfolio_id}_SELL_{formatted_price}"))
+            
+            if not any(o.get("client_order_id") == client_order_id for o in active_orders):
+                order_manager.register_active_order(client_order_id, {
+                    "client_order_id": client_order_id,
+                    "portfolio_id": portfolio_id, "product_id": product_id,
+                    "side": "SELL", "price": formatted_price, "status": "PENDING"
+                })
+                order_manager.enqueue({
+                    "action": "PLACE_ORDER",
+                    "source_pid": portfolio_id,
+                    "client_order_id": client_order_id,
+                    "product_id": product_id,
+                    "side": "SELL",
+                    "price": str(formatted_price),
+                    "size": str(SELL_SIZE),
+                    "post_only": True,
+                    "stp_id": str(uuid.uuid5(STP_NAMESPACE, f"{portfolio_id}_STP_SELL_{formatted_price}"))
+                })
+
+    except Exception as exc:
+        logger.exception("run_strategy failed: %s", exc)
