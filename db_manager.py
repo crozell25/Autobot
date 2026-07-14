@@ -127,6 +127,11 @@ async def run_db_manager():
                         "UPDATE orders_registry SET status = 'GHOST_PURGED' WHERE client_order_id = ?",
                         (task.get('client_order_id'),)
                     )
+                elif action == "MASS_PURGE_GHOSTS":
+                    await db.execute(
+                        "UPDATE orders_registry SET status = 'GHOST_PURGED' WHERE status = 'OPEN' AND portfolio_id = ?",
+                        (task.get('portfolio_id'),)
+                    )
                 await db.commit()
             
             queue.task_done()
@@ -144,6 +149,10 @@ def log_new_order(client_order_id, pid, product_id, side, price, size, stp_id):
 def update_order_status(client_order_id, status):
     get_db_queue().put_nowait({"action": "UPDATE_STATUS", "client_order_id": client_order_id, "status": status})
 
+def log_failed_order(client_order_id):
+    """Explicitly marks an order as FAILED to prevent ghost tracking."""
+    update_order_status(client_order_id, "FAILED")
+
 def log_trade_pnl(trade_id, client_order_id, pid, pnl, buy_price=0, sell_price=0, size=0):
     get_db_queue().put_nowait({
         "action": "LOG_PNL", 
@@ -158,6 +167,10 @@ def log_trade_pnl(trade_id, client_order_id, pid, pnl, buy_price=0, sell_price=0
 
 def purge_ghost_order(client_order_id):
     get_db_queue().put_nowait({"action": "PURGE_GHOSTS", "client_order_id": client_order_id})
+
+def mass_purge_portfolio_ghosts(portfolio_id):
+    """Emergency helper to wipe stuck OPEN orders for a specific portfolio."""
+    get_db_queue().put_nowait({"action": "MASS_PURGE_GHOSTS", "portfolio_id": portfolio_id})
 
 def queue_fee_reconciliation(trade_id, commission):
     get_db_queue().put_nowait({"action": "RECONCILE_FEE", "trade_id": trade_id, "commission": commission})
@@ -181,3 +194,18 @@ async def get_pending_fees_by_portfolio():
     except Exception as e:
         logger.error("Failed to fetch pending fees: %s", e)
     return pending
+
+def emergency_clean_db():
+    """Synchronous cleanup block designed to run from terminal."""
+    import sqlite3
+    print("Initiating emergency sweep of ALL stale OPEN orders...")
+    conn = sqlite3.connect("trading_bot.db")
+    cursor = conn.cursor()
+    cursor.execute("UPDATE orders_registry SET status = 'GHOST_PURGED' WHERE status = 'OPEN'")
+    purged = cursor.rowcount
+    conn.commit()
+    conn.close()
+    print(f"✅ Successfully purged {purged} ghost orders. Your reports will now be accurate.")
+
+if __name__ == "__main__":
+    emergency_clean_db()

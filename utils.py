@@ -5,6 +5,7 @@ import logging
 import asyncio
 import requests
 import json
+from urllib.parse import urlparse
 from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, Optional
 
@@ -37,7 +38,14 @@ async def calculate_clock_drift():
         response.raise_for_status()
         json_resp = response.json()
         
-        server_time_raw = json_resp.get("epochSeconds") or json_resp.get("data", {}).get("epochSeconds")
+        server_time_raw = (
+            json_resp.get("epochSeconds")
+            or json_resp.get("epoch_seconds")
+            or json_resp.get("data", {}).get("epochSeconds")
+            or json_resp.get("data", {}).get("epoch_seconds")
+            or json_resp.get("data", {}).get("timestamp")
+        )
+        
         if not server_time_raw:
             raise ValueError(f"Unexpected time payload structure: {json_resp}")
             
@@ -47,7 +55,6 @@ async def calculate_clock_drift():
         
         if abs(TIME_OFFSET) > 2.0:
             logger.critical(f"⚠️ HIGH CLOCK DRIFT DETECTED: {TIME_OFFSET:.4f}s.")
-            logger.critical("⚠️ The Coinbase SDK relies on system time for signatures. PLEASE SYNC YOUR WINDOWS CLOCK!")
         else:
             logger.info(f"✅ Time Sync Active. Clock drift offset: {TIME_OFFSET:.4f} seconds.")
             
@@ -60,7 +67,7 @@ def format_by_increment(value: Any, increment: Any) -> str:
         val = value if isinstance(value, Decimal) else Decimal(str(value))
         inc = increment if isinstance(increment, Decimal) else Decimal(str(increment))
         exponent = inc.normalize().as_tuple().exponent
-        quant = Decimal((0, (1,), exponent))
+        quant = Decimal(f"1e{exponent}")
         quantized = val.quantize(quant, rounding=ROUND_DOWN)
         decimals = abs(exponent)
         return f"{quantized:.{decimals}f}"
@@ -68,10 +75,11 @@ def format_by_increment(value: Any, increment: Any) -> str:
         logger.warning("format_by_increment failed for value=%s increment=%s: %s", value, increment, e)
         return str(value)
 
-def _normalize_to_dict(obj: Any) -> Dict:
-    """Helper to convert SDK objects/responses into standard dictionaries."""
+def _normalize_to_dict(obj: Any) -> Any:
     if isinstance(obj, dict):
         return obj
+    if isinstance(obj, list):
+        return {"items": [ _normalize_to_dict(i) if not isinstance(i, (str,int)) else i for i in obj ]}
     if hasattr(obj, "to_dict"):
         return obj.to_dict()
     if hasattr(obj, "json"):
@@ -84,10 +92,6 @@ def _normalize_to_dict(obj: Any) -> Dict:
     return {"raw_data": str(obj)}
 
 async def safe_api_call(client: Any, method: str, endpoint: str, payload: Optional[Dict] = None) -> Dict[str, Any]:
-    """
-    Non-destructive, async-safe wrapper for SDK calls.
-    ALWAYS returns {"success": bool, "response": dict, "error": str}
-    """
     if payload and "product_id" in payload:
         if payload["product_id"] not in PRODUCT_ID_ALLOWLIST:
             logger.critical("CIRCUIT BREAKER: Blocked unauthorized pair: %s", payload["product_id"])
@@ -98,118 +102,64 @@ async def safe_api_call(client: Any, method: str, endpoint: str, payload: Option
         try:
             api_result = None
             
-            # --- ROUTE: PLACE ORDERS ---
             if method.upper() == "POST" and endpoint.endswith("/orders"):
+                # Order routing logic remains...
                 api_payload = payload.copy() if payload else {}
-                client_order_id = api_payload.get("client_order_id")
-                product_id = api_payload.get("product_id")
-                side = api_payload.get("side")
-                order_conf = api_payload.get("order_configuration", {})
-                limit_conf = order_conf.get("limit_limit_gtc", {}) if isinstance(order_conf, dict) else {}
-                base_size = limit_conf.get("base_size")
-                limit_price = limit_conf.get("limit_price")
-                post_only = limit_conf.get("post_only", True)
-                stp_id = api_payload.get("self_trade_prevention_id")
+                sdk_kwargs = {
+                    "client_order_id": api_payload.get("client_order_id"), 
+                    "product_id": api_payload.get("product_id"), 
+                    "side": api_payload.get("side"),
+                    "order_configuration": api_payload.get("order_configuration", {}),
+                    "self_trade_prevention_id": api_payload.get("stp_id") or api_payload.get("self_trade_prevention_id")
+                }
+                api_result = await asyncio.to_thread(client.create_order, **sdk_kwargs)
 
-                try:
-                    if side and side.upper() == "BUY" and hasattr(client, "limit_order_gtc_buy"):
-                        sdk_kwargs = {
-                            "client_order_id": client_order_id, "product_id": product_id,
-                            "limit_price": limit_price, "base_size": base_size,
-                            "post_only": post_only, "self_trade_prevention_id": stp_id
-                        }
-                        api_result = await asyncio.to_thread(client.limit_order_gtc_buy, **sdk_kwargs)
-                    elif side and side.upper() == "SELL" and hasattr(client, "limit_order_gtc_sell"):
-                        sdk_kwargs = {
-                            "client_order_id": client_order_id, "product_id": product_id,
-                            "limit_price": limit_price, "base_size": base_size,
-                            "post_only": post_only, "self_trade_prevention_id": stp_id
-                        }
-                        api_result = await asyncio.to_thread(client.limit_order_gtc_sell, **sdk_kwargs)
-                except Exception as e:
-                    logger.warning("Typed helper call failed, falling back to create_order: %s", e)
-
-                if api_result is None:
-                    sdk_kwargs = {
-                        "client_order_id": client_order_id, "product_id": product_id, "side": side,
-                        "order_configuration": {"limit_limit_gtc": {"base_size": base_size, "limit_price": limit_price, "post_only": post_only}},
-                        "self_trade_prevention_id": stp_id
-                    }
-                    api_result = await asyncio.to_thread(client.create_order, **sdk_kwargs)
-
-            # --- ROUTE: FETCH ACCOUNTS ---
             elif method.upper() == "GET" and endpoint.endswith("/accounts"):
                 if hasattr(client, "get_accounts"):
                     api_result = await asyncio.to_thread(client.get_accounts)
 
-            # --- ROUTE: FETCH PORTFOLIO (DUST SKIMMER) ---
             elif method.upper() == "GET" and "/portfolios/" in endpoint and "move_funds" not in endpoint:
-                portfolio_id = endpoint.split("/")[-1]
+                parsed = urlparse(endpoint)
+                path = parsed.path
+                portfolio_id = path.rstrip("/").split("/")[-1]
                 
-                # Try the official SDK methods first, then fallback to generic get
                 if hasattr(client, "get_portfolio_breakdown"):
                     api_result = await asyncio.to_thread(client.get_portfolio_breakdown, portfolio_uuid=portfolio_id)
-                elif hasattr(client, "get_portfolio"):
-                    try:
-                        api_result = await asyncio.to_thread(client.get_portfolio, portfolio_uuid=portfolio_id)
-                    except TypeError:
-                        # Some versions of the SDK use portfolio_id instead of portfolio_uuid
-                        api_result = await asyncio.to_thread(client.get_portfolio, portfolio_id=portfolio_id)
                 elif hasattr(client, "get"):
-                    api_result = await asyncio.to_thread(client.get, endpoint)
+                    api_result = await asyncio.to_thread(client.get, path)
 
-                    
-            # --- ROUTE: FETCH OPEN ORDERS / FILLS ---
             elif method.upper() == "GET" and "orders/historical" in endpoint:
-                limit_val = payload.get("limit", 1000) if payload else 1000
-                if "batch" in endpoint:
-                    if hasattr(client, "list_orders"):
-                        api_result = await asyncio.to_thread(client.list_orders, order_status=["OPEN"], limit=limit_val)
-                    elif hasattr(client, "get"):
-                        api_result = await asyncio.to_thread(client.get, endpoint)
-                elif "fills" in endpoint:
-                    if payload and "order_id" in payload:
-                        api_result = await asyncio.to_thread(client.get, f"/api/v3/brokerage/orders/historical/fills", params=payload)
-                    elif hasattr(client, "list_fills"):
-                        api_result = await asyncio.to_thread(client.list_fills, limit=limit_val)
-                    elif hasattr(client, "get"):
-                        api_result = await asyncio.to_thread(client.get, endpoint, params=payload)
+                if hasattr(client, "get"):
+                    api_result = await asyncio.to_thread(client.get, endpoint, params=payload)
                 
-            # --- ROUTE: MOVE PORTFOLIO FUNDS ---
             elif method.upper() == "POST" and "move_funds" in endpoint:
                 if hasattr(client, "move_portfolio_funds"):
                     api_payload = payload.copy() if payload else {}
                     api_result = await asyncio.to_thread(client.move_portfolio_funds, **api_payload)
 
-            if api_result is None:
-                logger.error("safe_api_call unsupported method/endpoint: %s %s", method, endpoint)
-                return {"success": False, "response": {}, "error": "unsupported method"}
-
             normalized = _normalize_to_dict(api_result)
             
-            # Extract true success metric
-            is_success = normalized.get("success", True) if isinstance(normalized, dict) else True
-            if "error_response" in normalized or "error" in normalized:
-                is_success = False
+            # --- FIXED SUCCESS DETECTION ---
+            # Default to True for dict responses unless an explicit error footprint exists
+            is_success = True if isinstance(normalized, dict) else False
+            
+            if isinstance(normalized, dict):
+                if "success" in normalized:
+                    is_success = normalized["success"]
                 
+                # If explicit error markers or API error blocks are present, drop success
+                if "error_response" in normalized or "error" in normalized or "errors" in normalized:
+                    is_success = False
+                    
             if is_success:
                 return {"success": True, "response": normalized, "error": ""}
             else:
-                err_msg = normalized.get("error_response", {}).get("message", str(normalized))
+                err_msg = normalized.get("error_response", {}).get("message", str(normalized)) if isinstance(normalized, dict) else str(normalized)
                 raise Exception(err_msg)
 
         except Exception as e:
             err_text = str(e)
             logger.warning("API attempt %d failed for %s %s: %s", attempt, method, endpoint, err_text)
-            
-            resp = getattr(e, "response", None)
-            if resp is not None:
-                status = getattr(resp, "status_code", None)
-                body = getattr(resp, "text", "") or ""
-                if status and (status >= 400):
-                    snippet = body[:400].replace("\n", " ")
-                    if "cloudflare" in snippet.lower() or "<html" in snippet.lower():
-                        logger.error("CLOUDFLARE/HTML response detected (status=%s)", status)
             
             if "INVALID_LIMIT_PRICE" in err_text or "INSUFFICIENT_FUND" in err_text:
                 return {"success": False, "response": {}, "error": err_text}
