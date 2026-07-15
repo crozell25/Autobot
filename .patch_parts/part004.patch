@@ -1,0 +1,42 @@
+diff --git a/run.py b/run.py
+index e69de29..d4e5f6a 100644
+--- a/run.py
++++ b/run.py
+@@ -1,6 +1,20 @@
+-from manager import CoinbaseOrderManager
+-from utils import safe_api_call, calculate_clock_drift
+-import db_manager
++from manager import CoinbaseOrderManager
++from utils import safe_api_call, calculate_clock_drift
++import db_manager
++import collections
++import time
++
++portfolio_clients = load_portfolio_clients()
++order_manager = CoinbaseOrderManager(portfolio_clients)
++active_user_websockets = []
++
++
++class ConnectionManager:
++    """
++    Lightweight skeleton to manage primary/standby websocket clients and dedupe.
++    """
++    def __init__(self, max_cache: int = 5000):
++        self.processed = collections.OrderedDict()
++        self.max_cache = max_cache
++
++    def seen(self, key: str) -> bool:
++        return key in self.processed
++
++    def mark_seen(self, key: str):
++        try:
++            self.processed[key] = True
++            if len(self.processed) > self.max_cache:
++                self.processed.popitem(last=False)
++        except Exception:
++            pass
++
++conn_manager = ConnectionManager()
++
++# rest of run.py...
++

@@ -1,0 +1,215 @@
+diff --git a/utils.py b/utils.py
+index e69de29..a1b2c3d 100644
+--- a/utils.py
++++ b/utils.py
+@@ -1,6 +1,22 @@
++import os
++import time
++import logging
++from urllib.parse import urlparse
++import asyncio
++import requests
++import json
++from decimal import Decimal, ROUND_DOWN
++from typing import Any, Dict, Optional
++
++logger = logging.getLogger(__name__)
++
++async def calculate_clock_drift():
++    ...
++
++def format_by_increment(value: Any, increment: Any) -> str:
++    """
++    Quantize `value` to the precision implied by `increment`.
++    Uses Decimal quantization built from the increment's exponent in a robust way.
++    """
++    try:
++        val = value if isinstance(value, Decimal) else Decimal(str(value))
++        inc = increment if isinstance(increment, Decimal) else Decimal(str(increment))
++        exponent = inc.normalize().as_tuple().exponent
++        # Build quantizer robustly (handles negative, zero, and typical exponents)
++        quant = Decimal(f"1e{exponent}")
++        quantized = val.quantize(quant, rounding=ROUND_DOWN)
++        decimals = abs(exponent)
++        return f"{quantized:.{decimals}f}"
++    except Exception as e:
++        logger.warning("format_by_increment failed for value=%s increment=%s: %s", value, increment, e)
++        return str(value)
++
++
++def _extract_path_segment(endpoint: str) -> str:
++    """
++    Safely extract the last path segment from an endpoint URL or path.
++    Handles query strings and trailing slashes.
++    """
++    try:
++        parsed = urlparse(endpoint)
++        path = parsed.path or endpoint
++        return path.rstrip("/").split("/")[-1]
++    except Exception:
++        return endpoint.split("/")[-1] if "/" in endpoint else endpoint
++
++# (other utils follow)
++
+diff --git a/manager.py b/manager.py
+index e69de29..b2c3d4e 100644
+--- a/manager.py
++++ b/manager.py
+@@ -1,6 +1,22 @@
++from collections import deque, OrderedDict
++import asyncio
++from typing import Dict, Any
++
++class CoinbaseOrderManager:
++    def __init__(self, portfolio_clients: Dict[str, Any]):
++        self.processed_fills = set()
++        self.clients = portfolio_clients
++        self.active_orders: Dict[str, Dict[str, Any]] = {}
++        self.cost_basis_ledger: Dict[str, deque] = {pid: deque() for pid in portfolio_clients}
++
++        # Portfolio-Specific Ledger Locks (create lazily to avoid creating locks before event loop)
++        self.ledger_locks: Dict[str, asyncio.Lock] = {}
++
++        self._queue_lock = asyncio.Lock()
++        self.terminal_order_cache = OrderedDict()
++        self.CACHE_MAX_SIZE = 5000
++
++    def _ensure_lock(self, portfolio_id: str):
++        """Create an asyncio.Lock for a portfolio on demand (safe before/after loop start)."""
++        if portfolio_id not in self.ledger_locks:
++            self.ledger_locks[portfolio_id] = asyncio.Lock()
++
++    # rest of manager implementation...
++
+diff --git a/strategies/aero_aggressive_scalper.py b/strategies/aero_aggressive_scalper.py
+index e69de29..c3d4e5f 100644
+--- a/strategies/aero_aggressive_scalper.py
++++ b/strategies/aero_aggressive_scalper.py
+@@ -1,6 +1,28 @@
++import uuid
++import logging
++from decimal import Decimal
++from typing import Any, Dict
++from utils import format_by_increment
++
++logger = logging.getLogger("AggressiveScalper")
++
++# Constants
++SELL_SIZE = Decimal("0.1")
++BUY_SIZE = Decimal("0.1")
++MAX_SELL_ORDERS = 60
++MAX_BUY_ORDERS = 20
++STP_NAMESPACE = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
++STALE_THRESHOLD_PCT = Decimal("0.01")  # 1%
++
++def run_strategy(order_manager, market_data):
++    portfolio_id = market_data.get("portfolio_id")
++    product_id = market_data.get("product_id", "AERO-USDC")
++    mid_price = Decimal(str(market_data.get("price", "0")))
++    # Prefer explicit tick size from market_data; fallback to sensible default
++    tick_size = Decimal(str(market_data.get("tick_size", "0.00001")))
++    best_ask = market_data.get("best_ask")
++    best_bid = market_data.get("best_bid")
++
++    if mid_price <= 0 or not portfolio_id:
++        return
++
++    active_orders = [o for o in order_manager.active_orders.values()
++                     if o.get("portfolio_id") == portfolio_id and o.get("product_id") == product_id]
++
++    sell_orders = [o for o in active_orders if o.get("side") == "SELL"]
++    buy_orders = [o for o in active_orders if o.get("side") == "BUY"]
++
++    # Recalculate fresh count after potential prunes
++    fresh_sell_orders = [o for o in sell_orders if abs(Decimal(str(o.get("price", "0"))) - mid_price) / mid_price <= STALE_THRESHOLD_PCT]
++    fresh_buy_orders = [o for o in buy_orders if abs(Decimal(str(o.get("price", "0"))) - mid_price) / mid_price <= STALE_THRESHOLD_PCT]
++
++    # --- 3. Manage Aggressive Taker Buy ---
++    if len(fresh_buy_orders) < MAX_BUY_ORDERS:
++        # Taker: cross the best ask by one tick if available; otherwise use mid_price
++        if best_ask:
++            taker_price = Decimal(str(best_ask)) + tick_size
++        else:
++            taker_price = mid_price
++
++        formatted_taker_price = format_by_increment(taker_price, tick_size)
++        # Flood protection: avoid placing duplicate buy at same price
++        already_buy = any(str(o.get("price")) == formatted_taker_price and o.get("side") == "BUY" for o in active_orders)
++        if not already_buy:
++            order_manager.enqueue({
++                "action": "PLACE_ORDER",
++                "source_pid": portfolio_id,
++                "client_order_id": str(uuid.uuid4()),
++                "product_id": product_id,
++                "side": "BUY",
++                "price": str(formatted_taker_price),
++                "size": str(BUY_SIZE),
++                "post_only": False,  # Taker order to cross spread
++                "stp_id": str(uuid.uuid4())
++            })
++
++    # --- 4. Manage Sell Ladder (Maker) ---
++    if len(fresh_sell_orders) < 50:
++        target_price = mid_price * Decimal("1.001")  # 0.1% spread
++        formatted_price = format_by_increment(target_price, tick_size)
++        client_order_id = str(uuid.uuid5(STP_NAMESPACE, f"{portfolio_id}_SELL_{formatted_price}"))
++
++        # Avoid duplicate deterministic sell at same price across active and queued tasks
++        already_sell = any(o.get("client_order_id") == client_order_id for o in active_orders)
++        if not already_sell:
++            order_manager.enqueue({
++                "action": "PLACE_ORDER",
++                "source_pid": portfolio_id,
++                "client_order_id": client_order_id,
++                "product_id": product_id,
++                "side": "SELL",
++                "price": str(formatted_price),
++                "size": str(SELL_SIZE),
++                "post_only": True,  # Maker order
++                "stp_id": str(uuid.uuid5(STP_NAMESPACE, f"{portfolio_id}_STP_SELL_{formatted_price}"))
++            })
++
++    # rest of strategy...
++
+diff --git a/run.py b/run.py
+index e69de29..d4e5f6a 100644
+--- a/run.py
++++ b/run.py
+@@ -1,6 +1,20 @@
+-from manager import CoinbaseOrderManager
+-from utils import safe_api_call, calculate_clock_drift
+-import db_manager
++from manager import CoinbaseOrderManager
++from utils import safe_api_call, calculate_clock_drift
++import db_manager
++import collections
++import time
++
++portfolio_clients = load_portfolio_clients()
++order_manager = CoinbaseOrderManager(portfolio_clients)
++active_user_websockets = []
++
++
++class ConnectionManager:
++    """
++    Lightweight skeleton to manage primary/standby websocket clients and dedupe.
++    """
++    def __init__(self, max_cache: int = 5000):
++        self.processed = collections.OrderedDict()
++        self.max_cache = max_cache
++
++    def seen(self, key: str) -> bool:
++        return key in self.processed
++
++    def mark_seen(self, key: str):
++        try:
++            self.processed[key] = True
++            if len(self.processed) > self.max_cache:
++                self.processed.popitem(last=False)
++        except Exception:
++            pass
++
++conn_manager = ConnectionManager()
++
++# rest of run.py...
++
