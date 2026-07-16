@@ -6,14 +6,13 @@ import logging
 import asyncio
 from decimal import Decimal
 from collections import deque, OrderedDict
-<<<<<<< HEAD
 from typing import Dict, Any, Optional, Deque, List
 
 from utils import safe_api_call, _normalize_to_dict
 =======
 from typing import Dict, Any, Optional
 from utils import safe_api_call, _normalize_to_dict, validate_and_quantize, would_self_match, format_by_increment
->>>>>>> 357b415 (Finalize utils.py patch and sync with remote main)
+
 import db_manager
 
 logger = logging.getLogger("CoinbaseOrderManager")
@@ -46,7 +45,6 @@ class CoinbaseOrderManager:
     def _get_side(self, order: Dict[str, Any]) -> str:
         return (order.get("order_side") or order.get("side") or order.get("side_type") or "").upper()
 
-<<<<<<< HEAD
     def enqueue(self, payload: Dict[str, Any]) -> None:
         if payload.get("action") == "CANCEL_ORDER":
 =======
@@ -91,7 +89,7 @@ class CoinbaseOrderManager:
 
         # Queue routing
         if action in ["CANCEL_ORDER", "TRANSFER_PROFIT"]:
->>>>>>> 357b415 (Finalize utils.py patch and sync with remote main)
+
             self.priority_queue.append(payload)
         else:
             self.execution_queue.append(payload)
