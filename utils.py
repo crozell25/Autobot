@@ -136,4 +136,46 @@ async def safe_api_call(
         return {"success": False, "response": None, "error": "Timeout"}
     except Exception as e:
         logger.error("API exception [%s %s]: %s", method, endpoint, e, exc_info=True)
-        return {"success": False, "response": None, "error": str(e)}
+        return {"success": False, "response": None, "error": str(e)}# --- BEGIN: helpers required by manager.py ---
+from decimal import Decimal, InvalidOperation
+from typing import Tuple, Optional, List, Dict, Any
+
+def validate_and_quantize(price: Any, size: Any, tick_size: Any, formatter) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+    try:
+        if price is None or size is None:
+            return None, None
+        p = price if isinstance(price, Decimal) else Decimal(str(price))
+        s = size if isinstance(size, Decimal) else Decimal(str(size))
+        inc = tick_size if isinstance(tick_size, Decimal) else Decimal(str(tick_size))
+    except (InvalidOperation, ValueError, TypeError):
+        return None, None
+
+    if p <= 0 or s <= 0:
+        return None, None
+
+    try:
+        quant_exp = inc.normalize().as_tuple().exponent
+        p_q = p.quantize(Decimal(f'1e{quant_exp}'))
+    except Exception:
+        p_q = p
+
+    s_d = s.normalize()
+    return p_q, s_d
+
+def would_self_match(side: str, price: Decimal, active_orders: List[Dict[str, Any]]) -> bool:
+    try:
+        side_u = (side or "").upper()
+        for o in active_orders or []:
+            o_side = (o.get("side") or o.get("order_side") or "").upper()
+            try:
+                o_price = Decimal(str(o.get("price", "0")))
+            except Exception:
+                continue
+            if side_u == "BUY" and o_side == "SELL" and o_price <= price:
+                return True
+            if side_u == "SELL" and o_side == "BUY" and o_price >= price:
+                return True
+    except Exception:
+        return False
+    return False
+# --- END: helpers required by manager.py ---
