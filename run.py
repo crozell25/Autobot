@@ -1,46 +1,60 @@
 # run.py
 #!/usr/bin/env python3
-import aiosqlite
 import os
 import sys
 import json
 import ast
 import logging
 import asyncio
+import threading
 from uuid import uuid4
 from decimal import Decimal, InvalidOperation
 from logging.handlers import RotatingFileHandler
 from quart import Quart, jsonify
 from dotenv import load_dotenv
-from collections import defaultdict
-from order_rebalancer import evaluate_rebalances
 
+# Coinbase Advanced SDK imports
 try:
     from coinbase.rest import RESTClient
-    from coinbase.websocket import WSClient
+    from coinbase.websocket import WSClient, WSUserClient
 except Exception:
     RESTClient = None
     WSClient = None
+    WSUserClient = None
 
+# Four Pillars Architecture Imports
 from manager import CoinbaseOrderManager
 from utils import safe_api_call, calculate_clock_drift
 import db_manager
+from order_rebalancer import evaluate_rebalances
 
+# Dynamic Strategy Module Imports
 try:
     import strategies.aero_asymmetric_grid_v2 as aero_grid
-    import strategies.aero_reserves_ladder as aero_ladder
-    import strategies.aero_simple_ladder as aero_simple 
+    
+    import strategies.aero_simple_ladder as aero_simple
     import strategies.aero_aggressive_scalper as aero_scalper
 except ImportError as e:
+    logging.getLogger("Orchestrator").warning("Dynamic strategy import failed: %s", e)
     aero_grid = None
-    aero_ladder = None
-    aero_simple = None 
+    
+    aero_simple = None
     aero_scalper = None
+
+from hypercorn.asyncio import serve
+from hypercorn.config import Config
+from hypercorn.middleware import DispatcherMiddleware
+
+# =====================================================================
+# ENVIRONMENT & LOGGING INITIALIZATION
+# =====================================================================
 load_dotenv()
 
 if sys.platform == "win32":
-    try: sys.stdout.reconfigure(encoding="utf-8")
-    except Exception: pass
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 log_handlers = [
     RotatingFileHandler("engine.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8"),
@@ -49,6 +63,9 @@ log_handlers = [
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", handlers=log_handlers)
 logger = logging.getLogger("Orchestrator")
 
+# =====================================================================
+# APP & STATE REGISTRY
+# =====================================================================
 app = Quart(__name__)
 
 BOT_STATUS = {
@@ -57,18 +74,19 @@ BOT_STATUS = {
     "errors": []
 }
 
-def read_json_sync(filepath):
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+# Globally keep track of the private WebSockets so they don't get garbage collected
+active_user_websockets = []
 
+# =====================================================================
+# MULTI-TENANT CREDENTIAL ROUTER
+# =====================================================================
 def load_portfolio_clients():
     clients = {}
-    portfolios = read_json_sync("portfolios.json")
-    if not portfolios:
-        logger.error("❌ portfolios.json not found or invalid!")
+    try:
+        with open("portfolios.json", "r", encoding="utf-8") as f:
+            portfolios = json.load(f)
+    except Exception as e:
+        logger.error("❌ Failed to read portfolios.json: %s", e)
         return clients
 
     for name, pid in portfolios.items():
@@ -85,100 +103,216 @@ def load_portfolio_clients():
             continue
     
         if api_key and api_secret and RESTClient:
-            if "\\n" in api_secret: api_secret = api_secret.replace("\\n", "\n")
+            if "\\n" in api_secret:
+                api_secret = api_secret.replace("\\n", "\n")
             try:
                 clients[pid] = RESTClient(api_key=api_key, api_secret=api_secret)
                 logger.info("✅ Bound write permissions for portfolio: %s [%s]", name, pid[:8])
             except Exception as e:
                 logger.error("❌ Failed to create REST client for %s: %s", name, e)
+        else:
+            logger.error("❌ Missing credentials or RESTClient for strategy: %s", name)
     return clients
 
 portfolio_clients = load_portfolio_clients()
 order_manager = CoinbaseOrderManager(portfolio_clients)
-active_user_websockets = []
 
+# =====================================================================
+# STRATEGY ROUTER LOGIC
+# =====================================================================
 def route_strategy(portfolio_name, pid, order_manager, market_data):
     name_upper = portfolio_name.upper()
-    if name_upper.startswith("GRID") and aero_grid:
-        try: aero_grid.run_strategy(order_manager, market_data)
-        except Exception as e: logger.exception("Strategy error (grid): %s", e)
-    elif (name_upper.startswith("AERO RESERVE") or name_upper.startswith("RESERVE")) and aero_ladder:
-        try: aero_ladder.run_strategy(order_manager, market_data)
-        except Exception as e: logger.exception("Strategy error (reserve): %s", e)
-    elif name_upper.startswith("SCALP") and aero_scalper: # New assignment
-        logger.info(f"➡️ Routing '{portfolio_name}' to Aggressive Scalper Strategy...")
-        try: aero_scalper.run_strategy(order_manager, market_data)
-        except Exception as e: logger.exception("Strategy error (scalper): %s", e)
+
+    if name_upper.startswith("GRID"):
+        if aero_grid:
+            try:
+                aero_grid.run_strategy(order_manager, market_data)
+            except Exception as e:
+                logger.exception("Strategy execution error (grid) for %s: %s", portfolio_name, e)
+                
+    
+                
+    elif name_upper.startswith("SCALP"):
+        if aero_scalper:
+            try:
+                aero_scalper.run_strategy(order_manager, market_data)
+            except Exception as e:
+                logger.exception("Strategy execution error (scalp) for %s: %s", portfolio_name, e)
 
     elif name_upper.startswith("STRAT"):
-        if aero_simple is None: return
-        logger.info(f"➡️ Routing '{portfolio_name}' to Simple Ladder Strategy...")
-        try: aero_simple.run_strategy(order_manager, market_data)
-        except Exception as e: logger.exception("Strategy error (simple): %s", e)
+        if aero_simple is None:
+            logger.error(f"❌ '{portfolio_name}' triggered, but aero_simple_ladder.py failed to load!")
+            return
+            
+        try:
+            aero_simple.run_strategy(order_manager, market_data)
+        except Exception as e:
+            logger.exception("Strategy execution error (simple) for %s: %s", portfolio_name, e)
 
+# =====================================================================
+# UTILITIES: tolerant parsing helpers
+# =====================================================================
+def _extract_decimal(field):
+    if field is None:
+        return Decimal("0")
+    if isinstance(field, (int, float, Decimal)):
+        return Decimal(str(field))
+    if isinstance(field, dict):
+        v = field.get("value") or field.get("amount") or field.get("available") or "0"
+    else:
+        v = getattr(field, "value", None) or getattr(field, "amount", None) or str(field)
+    s = str(v).strip().replace(",", "").replace("$", "").replace("USDC", "").replace("AERO", "").strip()
+    if s == "" or s.lower() in ("none", "null", "nan"):
+        return Decimal("0")
+    try:
+        return Decimal(s)
+    except InvalidOperation:
+        return Decimal("0")
+
+def _normalize_accounts_response(resp):
+    if isinstance(resp, (dict, list)):
+        parsed = resp
+    else:
+        parsed = None
+        if hasattr(resp, "json"):
+            try: parsed = resp.json()
+            except Exception: parsed = None
+        if parsed is None:
+            body = getattr(resp, "text", None) or str(resp)
+            try: parsed = json.loads(body)
+            except Exception:
+                try: parsed = ast.literal_eval(body)
+                except Exception: parsed = None
+
+    if parsed is None: return []
+
+    if isinstance(parsed, dict):
+        for key in ("accounts", "data", "results", "items"):
+            if key in parsed and isinstance(parsed[key], list):
+                return parsed[key]
+        for v in parsed.values():
+            if isinstance(v, list):
+                return v
+        return []
+    elif isinstance(parsed, list):
+        return parsed
+    else:
+        return []
+
+# =====================================================================
+# CONCURRENT EXECUTION ENGINE
+# =====================================================================
 async def execute_single_task(task):
+    """Processes a single execution payload. Designed to run in parallel."""
     action_type = task.get("action")
-    pid = task.get("source_pid") or task.get("portfolio_id")
+    pid = task.get("source_pid")
     client = portfolio_clients.get(pid)
 
     if not client and not (os.getenv("DRY_RUN", "0") == "1"):
+        logger.error("❌ Cannot execute action %s: No API client found for portfolio UUID %s", action_type, pid)
         return
 
+    # --- PROCESS PLACE_ORDER ACTION ---
     if action_type == "PLACE_ORDER":
-        order_payload = {
-            "client_order_id": task.get("client_order_id", str(uuid4())),
-            "product_id": task["product_id"],
-            "side": task["side"].upper(),
-            "order_configuration": {
-                "limit_limit_gtc": {
-                    "base_size": str(Decimal(str(task["size"]))),
-                    "limit_price": str(Decimal(str(task["price"]))),
-                    "post_only": task.get("post_only", True),
-                }
-            },
-            "self_trade_prevention_id": task.get("stp_id", str(uuid4())),
-        }
+        safe_size_str = "{:.2f}".format(float(task["size"]))
+        safe_price_str = "{:.5f}".format(float(task["price"]))
+        
+        cid = task.get("client_order_id", str(uuid4()))
+        side = task.get("side", "").upper()
+        prod = task.get("product_id")
+        post = task.get("post_only", True)
+        stp = task.get("stp_id", str(uuid4()))
 
         if os.getenv("DRY_RUN", "0") == "1":
-            logger.info("[DRY_RUN] Would place order: %s", order_payload)
+            logger.info("[DRY_RUN] Would place %s order for %s @ %s", side, safe_size_str, safe_price_str)
         else:
-            api_result = await safe_api_call(client, "POST", "/api/v3/brokerage/orders", payload=order_payload)
-            if api_result["success"]:
-                logger.info("✅ Successfully placed %s order for portfolio %s", task["side"], pid[:8])
-                resp_data = api_result.get("response", {})
-                
-                # Safely extract the returned order details
-                success_resp = resp_data.get("success_response", {}) or resp_data.get("order", {})
-                if not success_resp: 
-                    success_resp = resp_data
-                    
-                exchange_id_val = success_resp.get("order_id") or success_resp.get("id")
-                returned_status = success_resp.get("status", "OPEN").upper()
+            is_successful = False
+            error_msg = "Unknown Error"
+            exchange_id_val = None
 
-                # If the exchange instantly killed the order (e.g. STP), don't save it to local memory
-                if returned_status in ["CANCELLED", "EXPIRED", "REJECTED", "FILLED"]:
-                    logger.info("⚡ Order %s instantly terminated by exchange (%s). Skipping memory lock.", order_payload["client_order_id"][:8], returned_status)
+            try:
+                # Use native SDK typed calls to completely avoid nested dictionary parameter bugs
+                if side == "BUY":
+                    api_response = await asyncio.to_thread(
+                        client.limit_order_gtc_buy,
+                        client_order_id=cid,
+                        product_id=prod,
+                        base_size=safe_size_str,
+                        limit_price=safe_price_str,
+                        post_only=post,
+                        self_trade_prevention_id=stp
+                    )
                 else:
-                    # Route through our new manager function to respect WS race conditions
-                    order_manager.register_active_order(order_payload["client_order_id"], {
-                        "client_order_id": order_payload["client_order_id"],
-                        "portfolio_id": pid, "product_id": task["product_id"],
-                        "side": task["side"].upper(), "price": task["price"],
-                        "status": "OPEN", "exchange_id": exchange_id_val 
-                    })
-                    
-                try:
-                    db_manager.log_new_order(order_payload['client_order_id'], pid, task['product_id'], task['side'].upper(), str(task['price']), str(task['size']), order_payload['self_trade_prevention_id'])
-                except Exception:
-                    pass
-            else:
-                logger.error("❌ Order rejected for %s: %s", pid[:8], api_result.get("error"))
+                    api_response = await asyncio.to_thread(
+                        client.limit_order_gtc_sell,
+                        client_order_id=cid,
+                        product_id=prod,
+                        base_size=safe_size_str,
+                        limit_price=safe_price_str,
+                        post_only=post,
+                        self_trade_prevention_id=stp
+                    )
 
+                if isinstance(api_response, dict):
+                    is_successful = api_response.get("success", False)
+                    if not is_successful:
+                        err_data = api_response.get("error_response", {})
+                        error_msg = err_data.get("message", str(api_response))
+                    else:
+                        exchange_id_val = api_response.get("success_response", {}).get("order_id")
+                elif api_response is not None:
+                    is_successful = getattr(api_response, "success", False)
+                    if not is_successful:
+                        err_resp = getattr(api_response, "error_response", None)
+                        if err_resp:
+                            error_msg = getattr(err_resp, "message", str(err_resp))
+                        else:
+                            error_msg = str(getattr(api_response, "failure_reason", api_response))
+                    else:
+                        success_resp = getattr(api_response, "success_response", None)
+                        if success_resp:
+                            exchange_id_val = getattr(success_resp, "order_id", None)
+                            
+            except Exception as e:
+                error_msg = str(e)
+
+            if is_successful:
+                logger.info("✅ Successfully placed %s order for portfolio %s", side, pid[:8])
+                
+                temp_id = f"local_{cid}"
+                order_manager.active_orders[temp_id] = {
+                    "client_order_id": cid,
+                    "portfolio_id": pid,
+                    "product_id": prod,
+                    "side": side,
+                    "price": safe_price_str,
+                    "status": "OPEN",
+                    "exchange_id": exchange_id_val 
+                }
+                
+                try:
+                    db_manager.log_new_order(
+                        client_order_id=cid,
+                        pid=pid,
+                        product_id=prod,
+                        side=side,
+                        price=safe_price_str,
+                        size=safe_size_str,
+                        stp_id=stp
+                    )
+                except Exception as e:
+                    logger.error("❌ Failed to queue new order to database: %s", e)
+            else:
+                logger.error("❌ Order placement rejected by Coinbase for %s: %s | Payload: %s", 
+                             pid[:8], error_msg, safe_price_str)
+
+    # --- PROCESS CANCEL_ORDER ACTION ---
     elif action_type == "CANCEL_ORDER":
         client_order_id = task.get("client_order_id")
         exchange_id = task.get("exchange_id")
         
         if not exchange_id:
+            logger.warning("❌ Cannot cancel: Missing exchange_id for local order %s", client_order_id)
             order_manager.active_orders.pop(f"local_{client_order_id}", None)
             return
 
@@ -190,45 +324,60 @@ async def execute_single_task(task):
             return
 
         if os.getenv("DRY_RUN", "0") == "1":
+            logger.info("[DRY_RUN] Would cancel order exchange_id: %s", exchange_id)
             success = True
         else:
             success = False
             try:
                 api_response = await asyncio.to_thread(client.cancel_orders, order_ids=[exchange_id])
-                if isinstance(api_response, dict) and api_response.get("results", [{}])[0].get("success"):
-                    success = True
-                elif getattr(getattr(api_response, "results", [None])[0], "success", False):
-                    success = True
-            except Exception: pass
+                
+                if isinstance(api_response, dict):
+                    results = api_response.get("results", [])
+                    if results and results[0].get("success"):
+                        success = True
+                elif api_response is not None:
+                    results = getattr(api_response, "results", [])
+                    if results and getattr(results[0], "success", False):
+                        success = True
+            except Exception as e:
+                logger.error("❌ Native cancel API call failed for %s: %s", exchange_id, e)
 
         order_manager.active_orders.pop(f"local_{client_order_id}", None)
 
         if success:
             logger.info("✅ Cancel confirmed and memory synced for: %s", str(client_order_id)[:8])
-            db_manager.update_order_status(client_order_id, 'CANCELLED')
+            try: db_manager.update_order_status(client_order_id, 'CANCELLED')
+            except Exception: pass
         else:
+            logger.warning("⚠️ Zombie Order detected! Cancel failed. Blacklisting ghost: %s", str(client_order_id)[:8])
             order_manager.dead_orders.add(exchange_id)
-            db_manager.update_order_status(client_order_id, 'GHOST_PURGED')
+            try: db_manager.update_order_status(client_order_id, 'GHOST_PURGED')
+            except Exception: pass
 
+    # --- PROCESS TRANSFER_PROFIT ACTION ---
     elif action_type == "TRANSFER_PROFIT":
         safe_amount = str(round(Decimal(str(task["amount"])), 6))
         transfer_payload = {
             "source_portfolio_uuid": pid,
             "target_portfolio_uuid": order_manager.profits_portfolio_id,
-            "value": safe_amount,
-            "currency": "USDC"
+            "funds": {
+                "value": safe_amount,
+                "currency": "USDC"
+            }
         }
         
         if os.getenv("DRY_RUN", "0") == "1":
+            logger.info("[DRY_RUN] Would transfer profit: %s", transfer_payload)
             success = True
         else:
-            api_result = await safe_api_call(client, "POST", "/api/v3/brokerage/portfolios/move_funds", payload=transfer_payload)
-            success = api_result.get("success", False)
+            success_dict = await safe_api_call(client, "POST", "/api/v3/brokerage/portfolios/move_funds", payload=transfer_payload)
+            success = success_dict.get("success", False)
 
         if success:
             logger.info("✅ Profit transfer successful for portfolio %s: %s USDC", pid[:8], safe_amount)
             if os.getenv("DRY_RUN", "0") != "1":
                 try:
+                    import aiosqlite
                     async with aiosqlite.connect("trading_bot.db") as db:
                         db.row_factory = aiosqlite.Row
                         cursor = await db.execute("SELECT amount_swept FROM pnl_swept_registry WHERE portfolio_id = ?", (pid,))
@@ -242,117 +391,47 @@ async def execute_single_task(task):
                             ON CONFLICT(portfolio_id) DO UPDATE SET amount_swept = excluded.amount_swept
                         """, (pid, str(new_swept)))
                         await db.commit()
-                except Exception: pass
+                except Exception as e:
+                    logger.error("❌ Failed to log successful sweep to tracking registry: %s", e)
         else:
-            logger.error("❌ Profit transfer rejected by exchange. Rolling back ledger batches.")
-            async with order_manager.ledger_lock:
-                for rolled_batch in reversed(task.get("rollback_batches", [])):
-                    order_manager.cost_basis_ledger[pid].appendleft(rolled_batch)
+            logger.error("❌ Profit transfer rejected by exchange.")
 
 async def process_execution_queue():
     while True:
         batch = await order_manager.drain_execution_queue(limit=5)
         if batch:
-            # FIX: Gather with exceptions isolated
-            results = await asyncio.gather(*(execute_single_task(task) for task in batch), return_exceptions=True)
-            for r in results:
-                if isinstance(r, Exception):
-                    logger.error("Execution task failed: %s", r, exc_info=True)
+            await asyncio.gather(*(execute_single_task(task) for task in batch))
             await asyncio.sleep(0.5) 
         else:
             await asyncio.sleep(1)
 
-async def fee_reconciliation_loop():
-    await asyncio.sleep(75)
-    logger.info("💸 Fee reconciliation loop initialized with Orphan Rescue.")
-    orphan_tracker = defaultdict(int)
+async def profit_sweeper_loop():
+    await asyncio.sleep(60) 
     
     while True:
         try:
-            if not BOT_STATUS["engine_active"]:
-                await asyncio.sleep(10)
-                continue
-
-            pending_by_pid = await db_manager.get_pending_fees_by_portfolio()
-            if not pending_by_pid:
-                orphan_tracker.clear() 
-                await asyncio.sleep(120)
-                continue
-
-            for pid, pending_orders in pending_by_pid.items():
-                client = portfolio_clients.get(pid)
-                if not client: continue
-
-                # CRITICAL FIX: 'payload', NOT 'params'
-                response = await safe_api_call(client, "GET", "/api/v3/brokerage/orders/historical/fills", payload={"limit": 100})
-                
-                commission_map = defaultdict(float)
-                if response.get("success"):
-                    fills = response.get("response", {}).get("fills", [])
-                    for fill in fills:
-                        o_id = fill.get("order_id")
-                        comm_str = fill.get("commission", "0.0")
-                        commission_map[o_id] += float(comm_str) if comm_str else 0.0
-
-                pending_set = set(pending_orders)
-                matched_in_batch = set()
-                
-                for o_id, total_commission in commission_map.items():
-                    if o_id in pending_set:
-                        db_manager.queue_fee_reconciliation(o_id, total_commission)
-                        matched_in_batch.add(o_id)
-                        orphan_tracker.pop(o_id, None)
-
-                unmatched = pending_set - matched_in_batch
-                for o_id in unmatched:
-                    orphan_tracker[o_id] += 1
-                    
-                    if orphan_tracker[o_id] >= 3:
-                        logger.info(f"[Fee Recon] Order {o_id[:8]} fell out of batch. Initiating rescue.")
-                        # CRITICAL FIX: 'payload', NOT 'params'
-                        rescue_res = await safe_api_call(client, "GET", "/api/v3/brokerage/orders/historical/fills", payload={"order_id": o_id})
-                        
-                        if rescue_res.get("success") and rescue_res.get("response", {}).get("fills"):
-                            rescue_comm = sum(float(f.get("commission", "0.0") or 0.0) for f in rescue_res["response"]["fills"])
-                            db_manager.queue_fee_reconciliation(o_id, rescue_comm)
-                            orphan_tracker.pop(o_id, None)
-                        else:
-                            if orphan_tracker[o_id] >= 5: 
-                                db_manager.queue_fee_error(o_id)
-                                orphan_tracker.pop(o_id, None)
-                                
-                await asyncio.sleep(0.5)
-
-        except Exception as e:
-            logger.error(f"[Fee Recon Error] Critical exception in loop: {e}")
-
-        await asyncio.sleep(120)
-
-async def reconciliation_watchdog():
-    await asyncio.sleep(45) 
-    while True:
-        try:
             if BOT_STATUS["engine_active"]:
-                logger.info("🔄 Running 5-minute state reconciliation sweep...")
-                await order_manager.sync_active_orders()
-        except Exception as e:
-            pass
-        await asyncio.sleep(300)
+                import aiosqlite
+                async with aiosqlite.connect("trading_bot.db") as db:
+                    await db.execute("""
+                        CREATE TABLE IF NOT EXISTS pnl_swept_registry (
+                            portfolio_id TEXT PRIMARY KEY,
+                            amount_swept TEXT
+                        )
+                    """)
+                    await db.commit()
 
-async def profit_sweeper_loop():
-    await asyncio.sleep(60)
-    while True:
-        try:
-            if BOT_STATUS["engine_active"]:
-                portfolios = await asyncio.to_thread(read_json_sync, "portfolios.json")
+                try:
+                    with open("portfolios.json", "r", encoding="utf-8") as f:
+                        portfolios = json.load(f)
+                except Exception: portfolios = {}
 
                 for name, pid in portfolios.items():
-                    if pid == order_manager.profits_portfolio_id:
-                        continue
+                    if pid == order_manager.profits_portfolio_id: continue
 
                     async with aiosqlite.connect("trading_bot.db") as db:
                         db.row_factory = aiosqlite.Row
-                        cursor = await db.execute("SELECT SUM(net_pnl) as total_pnl FROM grid_trades WHERE portfolio_id = ? AND fee NOT IN ('PENDING', 'FEE_NOT_FOUND')", (pid,))
+                        cursor = await db.execute("SELECT SUM(pnl) as total_pnl FROM grid_trades WHERE portfolio_id = ?", (pid,))
                         row = await cursor.fetchone()
                         total_realized = Decimal(str(row["total_pnl"] or "0"))
 
@@ -367,17 +446,15 @@ async def profit_sweeper_loop():
                         if not client: continue
                         
                         accounts_resp = await safe_api_call(client, "GET", "/api/v3/brokerage/accounts")
-                        available_usdc = Decimal("0")
+                        accounts_list = _normalize_accounts_response(accounts_resp)
                         
-                        if accounts_resp.get("success"):
-                            data = accounts_resp.get("response", {})
-                            accounts_list = data.get("accounts", []) or data.get("data", [])
-                            for acc in accounts_list:
-                                currency = acc.get("currency") if isinstance(acc, dict) else getattr(acc, "currency", None)
-                                if currency == "USDC":
-                                    bal_val = acc.get("available_balance", {}).get("value", "0") if isinstance(acc, dict) else getattr(acc.available_balance, "value", "0")
-                                    available_usdc = Decimal(str(bal_val))
-                                    break
+                        available_usdc = Decimal("0")
+                        for acc in accounts_list:
+                            currency = getattr(acc, 'currency', acc.get("currency"))
+                            if currency == "USDC":
+                                val = getattr(acc.available_balance, 'value', '0') if hasattr(acc, 'available_balance') else acc.get("available_balance", {}).get("value", "0")
+                                available_usdc = Decimal(str(val))
+                                break
 
                         safe_wallet_allowance = available_usdc - Decimal("10.00")
                         final_sweep_amount = min(sweepable_pnl, safe_wallet_allowance)
@@ -385,117 +462,122 @@ async def profit_sweeper_loop():
                         if final_sweep_amount >= Decimal("1.00"):
                             logger.info("💰 [SWEEPER] Realized PnL detected for %s. Total Realized: $%s | Already Swept: $%s. Scheduling sweep for: %s USDC", 
                                         name[:8], total_realized, total_swept, final_sweep_amount)
-                            
-                            order_manager.enqueue({
-                                "action": "TRANSFER_PROFIT",
-                                "source_pid": pid,
-                                "amount": str(final_sweep_amount)
+                            order_manager.execution_queue.append({
+                                "action": "TRANSFER_PROFIT", "source_pid": pid, "amount": str(final_sweep_amount)
                             })
-        except Exception:
-            pass
-        await asyncio.sleep(300)
+
+        except Exception as e:
+            logger.error("❌ Error in profit_sweeper_loop iteration: %s", e)
+        await asyncio.sleep(300) 
 
 async def autonomous_trading_loop():
+    """
+    Monitors portfolios.json configurations, pulls data feeds, and routes traffic.
+    """
+    import time
     portfolio_balances = {}
+    
     while True:
         try:
             if BOT_STATUS["engine_active"]:
-                portfolios = await asyncio.to_thread(read_json_sync, "portfolios.json")
+                try:
+                    with open("portfolios.json", "r", encoding="utf-8") as f:
+                        portfolios = json.load(f)
+                except Exception:
+                    portfolios = {}
 
                 for name, pid in portfolios.items():
                     client = portfolio_clients.get(pid)
                     if not client: continue
 
                     try:
-                        accounts_resp = await safe_api_call(client, "GET", "/api/v3/brokerage/accounts")
-                        if accounts_resp.get("success"):
-                            data = accounts_resp.get("response", {})
-                            accounts_list = data.get("accounts", []) or data.get("data", [])
+                        params = {
+                            "limit": 250, 
+                            "retail_portfolio_id": pid
+                        }
+                        accounts_resp = await safe_api_call(client, "GET", "/api/v3/brokerage/accounts", payload=params)
+                        
+                        accounts_list = []
+                        if isinstance(accounts_resp.get("response"), dict):
+                            accounts_list = accounts_resp["response"].get("accounts", [])
+                        
+                        aero_avail = Decimal("0")
+                        aero_hold = Decimal("0")
+                        usdc_avail = Decimal("0")
 
-                            for acc in accounts_list:
-                                if isinstance(acc, dict):
-                                    acc_pid = acc.get("retail_portfolio_id", "UNKNOWN")
-                                    currency = acc.get("currency")
-                                    avail = Decimal(str(acc.get("available_balance", {}).get("value", "0")))
-                                else:
-                                    acc_pid = getattr(acc, 'retail_portfolio_id', "UNKNOWN")
-                                    currency = getattr(acc, 'currency', None)
-                                    avail = Decimal(str(getattr(acc.available_balance, 'value', '0')))
-                                
-                                if acc_pid not in portfolio_balances:
-                                    portfolio_balances[acc_pid] = {"AERO": "0", "USDC": "0"}
-                                
-                                if currency == "AERO":
-                                    # TELEMETRY FIX: Strict available balance, dropping held capital
-                                    portfolio_balances[acc_pid]["AERO"] = str(avail)
-                                elif currency == "USDC":
-                                    portfolio_balances[acc_pid]["USDC"] = str(avail)
+                        for acc in accounts_list:
+                            if hasattr(acc, 'currency'): 
+                                currency = acc.currency
+                                avail = Decimal(str(getattr(acc.available_balance, 'value', '0')))
+                                hold = Decimal(str(getattr(acc.hold, 'value', '0')))
+                            else: 
+                                currency = acc.get("currency")
+                                avail = Decimal(str(acc.get("available_balance", {}).get("value", "0")))
+                                hold = Decimal(str(acc.get("hold", {}).get("value", "0")))
+                            
+                            if not currency:
+                                continue
+
+                            if currency == "AERO":
+                                aero_avail += avail
+                                aero_hold += hold
+                            elif currency == "USDC":
+                                usdc_avail += avail
+
+                        portfolio_balances[pid] = {
+                            "AERO": str(aero_avail + aero_hold),
+                            "USDC": str(usdc_avail)
+                        }
 
                     except Exception as e:
                         logger.warning("Failed to fetch balances for %s: %s", name, e)
 
                     balances = portfolio_balances.get(pid, {"AERO": "0", "USDC": "0"})
-                    aero_avail = Decimal(balances.get("AERO", "0"))
-                    usdc_avail = Decimal(balances.get("USDC", "0"))
+                    aero_bal = balances.get("AERO", "0")
+                    usdc_bal = balances.get("USDC", "0")
 
-                    # --- LOCAL QUEUE RESERVATION SYSTEM ---
-                    # Deduct funds already committed in the execution queues to prevent double-spending
-                    reserved_aero = Decimal("0")
-                    reserved_usdc = Decimal("0")
+                    logger.info("Telemetry [%s] -> Price: %s | AERO: %s | USDC: %s | Queue: %d",
+                                name[:8], order_manager.live_ticker_price, aero_bal, usdc_bal, len(order_manager.execution_queue))
+
+                    # ---------------------------------------------------------
+                    # CRITICAL FIX: Synchronize the timing architecture.
+                    # ---------------------------------------------------------
+                    current_unix_time = time.time()
                     
-                    try:
-                        queued_tasks = list(order_manager.priority_queue) + list(order_manager.execution_queue)
-                        for task in queued_tasks:
-                            if task.get("action") == "PLACE_ORDER" and (task.get("source_pid") == pid or task.get("portfolio_id") == pid):
-                                side = task.get("side", "").upper()
-                                try:
-                                    size_dec = Decimal(str(task.get("size", "0")))
-                                    price_dec = Decimal(str(task.get("price", "0")))
-                                    
-                                    if side == "SELL":
-                                        reserved_aero += size_dec
-                                    elif side == "BUY":
-                                        # Size is base size, price is quote price. Total quote required = size * price
-                                        reserved_usdc += (size_dec * price_dec)
-                                except Exception:
-                                    pass
-                    except Exception as e:
-                        logger.warning("Queue parsing error: %s", e)
-
-                    aero_effective = max(Decimal("0"), aero_avail - reserved_aero)
-                    usdc_effective = max(Decimal("0"), usdc_avail - reserved_usdc)
-
-                    logger.info("Telemetry [%s] -> Price: %s | AERO: %s (Eff: %s) | USDC: %s (Eff: %s) | Queue: %d",
-                                name[:8], order_manager.live_ticker_price, 
-                                aero_avail, aero_effective, usdc_avail, usdc_effective, 
-                                len(order_manager.execution_queue))
-
                     market_context = {
                         "price": order_manager.live_ticker_price,
                         "current_price": order_manager.live_ticker_price,
                         "live_price": order_manager.live_ticker_price,
-                        "timestamp": asyncio.get_event_loop().time(),
-                        "portfolio_id": pid, 
-                        "aero_bal": str(aero_effective), # Passing safe bounds to the strategy bots
-                        "usdc_bal": str(usdc_effective),
+                        "timestamp": current_unix_time,
+                        "portfolio_id": pid,
+                        "aero_bal": aero_bal,
+                        "usdc_bal": usdc_bal,
                     }
 
                     try:
                         if order_manager.live_ticker_price > 0:
                             evaluate_rebalances(order_manager, pid, order_manager.live_ticker_price, "AERO-USDC")
-                    except Exception: pass
+                    except Exception as e:
+                        pass
 
-                    try: route_strategy(name, pid, order_manager, market_context)
-                    except Exception: pass
+                    try:
+                        route_strategy(name, pid, order_manager, market_context)
+                    except Exception as e:
+                        logger.exception("Error routing strategy for %s: %s", name, e)
 
                     await asyncio.sleep(0.3)
-
         except Exception as e:
             logger.error("Error in autonomous_trading_loop iteration: %s", e)
 
         await asyncio.sleep(10)
 
+
+# =====================================================================
+# STARTUP HANDSHAKE ENGINE
+# =====================================================================
+
 async def load_active_orders_from_db():
+    import aiosqlite
     loaded_count = 0
     try:
         async with aiosqlite.connect("trading_bot.db") as db:
@@ -506,37 +588,54 @@ async def load_active_orders_from_db():
             for row in rows:
                 temp_id = f"local_{row['client_order_id']}"
                 order_manager.active_orders[temp_id] = {
-                    "client_order_id": row['client_order_id'], "portfolio_id": row['portfolio_id'],
-                    "product_id": row['product_id'], "side": row['side'],
-                    "price": str(row['price']), "status": "OPEN", "exchange_id": row['exchange_id']
+                    "client_order_id": row['client_order_id'],
+                    "portfolio_id": row['portfolio_id'],
+                    "product_id": row['product_id'],
+                    "side": row['side'],
+                    "price": str(row['price']),
+                    "status": "OPEN",
+                    "exchange_id": row['exchange_id']
                 }
                 loaded_count += 1
         logger.info("✅ Zero-Amnesia Boot: Loaded %d active orders from local registry.", loaded_count)
     except Exception as e:
         logger.error("❌ Failed to load active orders from database: %s", e)
 
+@app.before_serving
 async def boot_sequence():
+    order_manager.loop = asyncio.get_running_loop()
     await db_manager.init_db()
     await load_active_orders_from_db()
     
-    logger.info("Initializing ledger priming sequence...")
-    await order_manager.prime_ledger()
+    await order_manager.start_background_tasks()
+    app.add_background_task(db_manager.run_db_manager)
+    app.add_background_task(process_execution_queue)
+    app.add_background_task(autonomous_trading_loop)
+    app.add_background_task(profit_sweeper_loop)
 
     PUB_KEY = os.getenv("COINBASE_PUBLIC_KEY")
     PUB_SECRET = os.getenv("COINBASE_PUBLIC_SECRET")
+    
     if PUB_KEY and PUB_SECRET and WSClient:
-        try:
-            ws_public = WSClient(api_key=PUB_KEY, api_secret=PUB_SECRET, on_message=order_manager.on_ticker_message)
-            ws_public.open()
-            ws_public.subscribe(product_ids=["AERO-USDC"], channels=["ticker"])
-            logger.info("✅ Public ticker stream connected (Read-Only).")
-            BOT_STATUS["websocket_public_connected"] = True
-        except Exception as e:
-            logger.error("❌ Failed to connect public WebSocket: %s", e)
+        def start_market_ws():
+            try:
+                clean_secret = PUB_SECRET.replace("\\n", "\n")
+                market_ws = WSClient(api_key=PUB_KEY, api_secret=clean_secret, on_message=order_manager.on_ticker_message)
+                market_ws.open()
+                market_ws.subscribe(product_ids=["AERO-USDC"], channels=["ticker", "heartbeats"])
+                market_ws.run_forever_with_exception_check()
+            except Exception as e:
+                logger.error(f"Market WS crashed: {e}")
+        
+        threading.Thread(target=start_market_ws, daemon=True, name="MarketWSThread").start()
+        logger.info("✅ Public ticker stream connecting (Read-Only).")
+        BOT_STATUS["websocket_public_connected"] = True
+    else:
+        logger.warning("⚠️ No global public credentials found to open market WebSocket.")
 
-    from coinbase.websocket import WSUserClient
     try:
-        portfolios_config = read_json_sync("portfolios.json")
+        with open("portfolios.json", "r", encoding="utf-8") as f:
+            portfolios_config = json.load(f)
             
         for name, pid in portfolios_config.items():
             clean_name = name.upper().replace(" ", "_").replace(":", "")
@@ -547,37 +646,32 @@ async def boot_sequence():
                 api_key = os.getenv("COINBASE_PRIVATE_KEY")
                 api_secret = os.getenv("COINBASE_PRIVATE_SECRET")
 
-            if api_key and api_secret:
-                try:
-                    if "\\n" in api_secret: api_secret = api_secret.replace("\\n", "\n")
-                    ws_user = WSUserClient(api_key=api_key, api_secret=api_secret, on_message=order_manager.on_user_message)
-                    ws_user.open()
-                    ws_user.user(product_ids=["AERO-USDC", "AERO-USD", "USDC-USD"]) 
-                    active_user_websockets.append(ws_user) 
-                    logger.info("✅ Private user stream connected for %s [%s]", name, pid[:8])
-                except Exception as e:
-                    logger.error("❌ Failed to connect private WebSocket for %s: %s", name, e)
+            if api_key and api_secret and WSUserClient:
+                def start_user_ws(ak, asec, p_name):
+                    try:
+                        clean_sec = asec.replace("\\n", "\n")
+                        ws_user = WSUserClient(api_key=ak, api_secret=clean_sec, on_message=order_manager.on_user_message)
+                        ws_user.open()
+                        ws_user.user(product_ids=[]) 
+                        active_user_websockets.append(ws_user)
+                        ws_user.run_forever_with_exception_check()
+                    except Exception as e:
+                        logger.error(f"User WS crashed for {p_name}: {e}")
+
+                threading.Thread(target=start_user_ws, args=(api_key, api_secret, name), daemon=True, name=f"UserWS_{clean_name}").start()
+                logger.info("✅ Private user stream connecting for %s [%s]", name, pid[:8])
+            else:
+                logger.warning("⚠️ No credentials found to open user WebSocket for %s", name)
 
     except Exception as e:
          logger.error("❌ Failed to initialize multi-tenant WebSockets: %s", e)
 
     BOT_STATUS["engine_active"] = True
-    logger.info("🚀 All infrastructure loops online with segregated key scopes.")
+    logger.info("🚀 Trading engine initialized. WebSockets and Strategies are LIVE.")
 
-@app.before_serving
-async def initialize_pillars():
-    order_manager.profits_portfolio_id = "ca3e8f25-8dd3-4a58-89b4-884d2e10519b"
-    order_manager.loop = asyncio.get_running_loop() 
-    await calculate_clock_drift()
-    app.add_background_task(boot_sequence)
-    app.add_background_task(db_manager.run_db_manager)
-    app.add_background_task(process_execution_queue)
-    app.add_background_task(fee_reconciliation_loop)
-    app.add_background_task(order_manager.skim_dust)
-    app.add_background_task(autonomous_trading_loop)
-    app.add_background_task(reconciliation_watchdog)
-    app.add_background_task(profit_sweeper_loop)
-
+# =====================================================================
+# REST ENDPOINTS
+# =====================================================================
 @app.route("/status", methods=["GET"])
 async def status_dashboard():
     return jsonify({
@@ -587,10 +681,22 @@ async def status_dashboard():
         "active_portfolios": list(portfolio_clients.keys())
     })
 
-if __name__ == "__main__":
-    import hypercorn.asyncio
-    from hypercorn.config import Config
+# Combine Quart + FastAPI dashboard
+from db_manager import app as dashboard_app
+combined_app = DispatcherMiddleware({"/": app, "/dashboard": dashboard_app})
 
-    config = Config()
-    config.bind = ["0.0.0.0:5000"]
-    asyncio.run(hypercorn.asyncio.serve(app, config))
+config = Config()
+config.bind = ["0.0.0.0:8000"]
+
+# =====================================================================
+# ENTRYPOINT
+# =====================================================================
+if __name__ == "__main__":
+    try:
+        # Run the server
+        asyncio.run(serve(combined_app, config))
+    except (KeyboardInterrupt, asyncio.exceptions.CancelledError):
+        # Catch CTRL+C and swallow the ugly CancelledError traceback
+        print("\n✅ Trading Engine successfully powered down.")
+    except Exception as e:
+        logger.error("Engine terminated with error: %s", e)
