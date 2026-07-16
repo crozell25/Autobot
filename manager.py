@@ -8,11 +8,7 @@ from decimal import Decimal
 from collections import deque, OrderedDict
 from typing import Dict, Any, Optional, Deque, List
 
-from utils import safe_api_call, _normalize_to_dict
-=======
-from typing import Dict, Any, Optional
 from utils import safe_api_call, _normalize_to_dict, validate_and_quantize, would_self_match, format_by_increment
-
 import db_manager
 
 logger = logging.getLogger("CoinbaseOrderManager")
@@ -45,9 +41,6 @@ class CoinbaseOrderManager:
     def _get_side(self, order: Dict[str, Any]) -> str:
         return (order.get("order_side") or order.get("side") or order.get("side_type") or "").upper()
 
-    def enqueue(self, payload: Dict[str, Any]) -> None:
-        if payload.get("action") == "CANCEL_ORDER":
-=======
     def _normalize_pid(self, payload: Dict[str, Any]) -> str:
         return payload.get("source_pid") or payload.get("portfolio_id") or payload.get("pid")
 
@@ -89,7 +82,6 @@ class CoinbaseOrderManager:
 
         # Queue routing
         if action in ["CANCEL_ORDER", "TRANSFER_PROFIT"]:
-
             self.priority_queue.append(payload)
         else:
             self.execution_queue.append(payload)
@@ -183,7 +175,7 @@ class CoinbaseOrderManager:
                     trade_id: str = exchange_id if exchange_id else str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{portfolio_id}-{sell_price}-{sell_size}-{uuid.uuid4()}"))
                     await self.log_pnl_to_db(portfolio_id=portfolio_id, realized_pnl=realized_usdc, trade_id=trade_id, client_order_id=client_order_id, buy_price=str(avg_buy_price), sell_price=str(sell_price), size=str(executed_size))
             except Exception as e:
-                logger.error("❌ FATAL ERROR IN calculate_and_sweep for %s: %s", portfolio_id, e, exc_info=True)
+                logger.error("? FATAL ERROR IN calculate_and_sweep for %s: %s", portfolio_id, e, exc_info=True)
 
     async def sync_active_orders(self) -> None:
         """
@@ -228,7 +220,7 @@ class CoinbaseOrderManager:
 
                                 self.processed_fills.add(loc_cid)
                                 
-                                logger.info("👻 [Watchdog] Harvested missing FILL payload for %s. Routing to ledger.", loc_cid[:8])
+                                logger.info("?? [Watchdog] Harvested missing FILL payload for %s. Routing to ledger.", loc_cid[:8])
                                 if side == "BUY":
                                     await self.add_buy_to_ledger(pid, price, size)
                                 elif side == "SELL":
@@ -350,7 +342,7 @@ class CoinbaseOrderManager:
                         elif side == "SELL":
                             asyncio.run_coroutine_threadsafe(self.calculate_and_sweep(pid, price, size, client_order_id, exchange_id), self.loop)
                     else:
-                        logger.error("❌ Threading Error: OrderManager loop not attached. Cannot process Fill.")
+                        logger.error("? Threading Error: OrderManager loop not attached. Cannot process Fill.")
                 except Exception as e:
                     logger.error("Error handling user order event: %s\n%s", order, e)
 
