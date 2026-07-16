@@ -1,0 +1,165 @@
+diff --git a/utils.py b/utils.py
+diff --git a/utils.py b/utils.py
+index e69de29..a1b2c3d 100644
+--- a/utils.py
++++ b/utils.py
+@@ -1,6 +1,28 @@
+ import os
+ import time
+ import logging
++from urllib.parse import urlparse
+ import asyncio
+ import requests
+ import json
+ from decimal import Decimal, ROUND_DOWN
+ from typing import Any, Dict, Optional
++from decimal import InvalidOperation
++
++logger = logging.getLogger(__name__)
++
++def validate_and_quantize(price, size, tick_size, format_by_increment_fn):
++    """
++    Validate numeric order params and quantize price to tick_size.
++    Returns (Decimal(price_q), Decimal(size_d)) or (None, None) on invalid input.
++    """
++    try:
++        price_d = price if isinstance(price, Decimal) else Decimal(str(price))
++        size_d = size if isinstance(size, Decimal) else Decimal(str(size))
++    except (InvalidOperation, TypeError, ValueError):
++        logger.warning("Rejecting order: invalid numeric params price=%s size=%s", price, size)
++        return None, None
++    if price_d <= 0 or size_d <= 0:
++        logger.warning("Rejecting order: non-positive price/size price=%s size=%s", price_d, size_d)
++        return None, None
++    try:
++        price_q = Decimal(format_by_increment_fn(price_d, tick_size))
++    except Exception:
++        logger.exception("Quantize failed for price=%s tick=%s", price_d, tick_size)
++        return None, None
++    return price_q, size_d
++
++def would_self_match(side: str, price_q: Decimal, active_orders: list) -> bool:
++    """
++    Conservative check: returns True if placing `side` at price_q would match an existing opposite order.
++    active_orders is a list of order dicts for the same portfolio/product.
++    """
++    from decimal import Decimal as _D
++    if side == "BUY":
++        return any(
++            o for o in active_orders
++            if o.get("side") == "SELL" and _D(str(o.get("price", "0"))) <= price_q
++        )
++    return any(
++        o for o in active_orders
++        if o.get("side") == "BUY" and _D(str(o.get("price", "0"))) >= price_q
++    )
++
++def _extract_path_segment(endpoint: str) -> str:
++    """
++    Safely extract the last path segment from an endpoint URL or path.
++    Handles query strings and trailing slashes.
++    """
++    try:
++        parsed = urlparse(endpoint)
++        path = parsed.path or endpoint
++        return path.rstrip("/").split("/")[-1]
++    except Exception:
++        return endpoint.split("/")[-1] if "/" in endpoint else endpoint
+@@
+ def format_by_increment(value: Any, increment: Any) -> str:
+     """
+     Format a numeric value according to a tick increment.
+@@
+     except Exception as e:
+         logger.warning("format_by_increment failed for value=%s increment=%s: %s", value, increment, e)
+         return str(value)
+diff --git a/manager.py b/manager.py
+index e69de29..b2c3d4e 100644
+--- a/manager.py
++++ b/manager.py
+@@ -1,6 +1,16 @@
+-from collections import deque, OrderedDict
+-import asyncio
+-from typing import Dict, Any
++from collections import deque, OrderedDict
++import asyncio
++import uuid
++from decimal import Decimal
++from typing import Dict, Any
++import logging
++
++from utils import validate_and_quantize, would_self_match, format_by_increment
++
++logger = logging.getLogger(__name__)
+@@
+ class CoinbaseOrderManager:
+     def __init__(self, portfolio_clients: Dict[str, Any]):
+         self.processed_fills = set()
+         self.clients = portfolio_clients
+         self.active_orders: Dict[str, Dict[str, Any]] = {}
+         self.cost_basis_ledger: Dict[str, deque] = {pid: deque() for pid in portfolio_clients}
+ 
+         # Portfolio-Specific Ledger Locks (create lazily to avoid creating locks before event loop)
+         self.ledger_locks: Dict[str, asyncio.Lock] = {}
+ 
+         self._queue_lock = asyncio.Lock()
+         self.terminal_order_cache = OrderedDict()
+         self.CACHE_MAX_SIZE = 5000
+@@
+     def _ensure_lock(self, portfolio_id: str):
+         """Create an asyncio.Lock for a portfolio on demand (safe before/after loop start)."""
+         if portfolio_id not in self.ledger_locks:
+             self.ledger_locks[portfolio_id] = asyncio.Lock()
++
++    def _normalize_pid(self, payload: Dict[str, Any]) -> str:
++        return payload.get("source_pid") or payload.get("portfolio_id") or payload.get("pid")
+@@
+     def enqueue(self, payload: Dict[str, Any]):
+-        # existing enqueue implementation...
++        """
++        Central enqueue for tasks. PLACE_ORDER payloads are validated and checked
++        for conservative self-match avoidance and id uniqueness here.
++        """
++        action = payload.get("action")
++        if action == "PLACE_ORDER":
++            # Extract and normalize fields
++            price = payload.get("price")
++            size = payload.get("size")
++            # prefer explicit tick_size from payload, fallback to a sensible default
++            tick_size = payload.get("tick_size") or payload.get("market_tick_size") or Decimal("0.00001")
++
++            # 1) validate and quantize
++            price_q, size_d = validate_and_quantize(price, size, tick_size, format_by_increment)
++            if price_q is None:
++                # invalid params; helper already logged
++                return
++
++            # update payload with quantized values
++            payload["price"] = str(price_q)
++            payload["size"] = str(size_d)
++
++            # 2) ensure unique IDs for taker orders; deterministic only for maker/post_only
++            if not payload.get("post_only", False):
++                payload["stp_id"] = payload.get("stp_id") or str(uuid.uuid4())
++                payload["client_order_id"] = payload.get("client_order_id") or str(uuid.uuid4())
++            else:
++                # deterministic id for maker orders if not provided
++                if not payload.get("client_order_id"):
++                    pid = self._normalize_pid(payload) or "unknown"
++                    payload["client_order_id"] = str(uuid.uuid5(uuid.NAMESPACE_OID, f"{pid}_{payload.get('side')}_{price_q}"))
++
++            # 3) conservative self-match check using current active orders for this portfolio/product
++            portfolio_id = self._normalize_pid(payload)
++            product_id = payload.get("product_id")
++            active = [o for o in self.active_orders.values()
++                      if o.get("portfolio_id") == portfolio_id and o.get("product_id") == product_id]
++
++            if would_self_match(payload.get("side"), price_q, active):
++                logger.info("Skipping PLACE_ORDER that would self-match: pid=%s product=%s side=%s price=%s client_order_id=%s",
++                            portfolio_id, product_id, payload.get("side"), price_q, payload.get("client_order_id"))
++                return
++
++        # existing enqueue logic continues below...
++        # (original enqueue implementation should follow here)
++        # For brevity this patch inserts validation/guards above the existing logic.
+*** End Patch

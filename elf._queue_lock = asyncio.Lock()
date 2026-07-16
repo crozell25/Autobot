@@ -1,0 +1,106 @@
+[35mdb_manager.py[m[36m:[m[32m21[m[36m:[m                    [1;31mclient_order_id[m TEXT PRIMARY KEY,
+[35mdb_manager.py[m[36m:[m[32m29[m[36m:[m                    [1;31mstp_id[m TEXT,
+[35mdb_manager.py[m[36m:[m[32m36[m[36m:[m                    [1;31mclient_order_id[m TEXT NOT NULL,
+[35mdb_manager.py[m[36m:[m[32m43[m[36m:[m                    FOREIGN KEY ([1;31mclient_order_id[m) REFERENCES orders_registry([1;31mclient_order_id[m)
+[35mdb_manager.py[m[36m:[m[32m94[m[36m:[m                        "INSERT OR REPLACE INTO orders_registry ([1;31mclient_order_id[m, portfolio_id, product_id, side, price, size, status, [1;31mstp_id[m) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+[35mdb_manager.py[m[36m:[m[32m95[m[36m:[m                        (task.get('[1;31mclient_order_id[m'), task.get('portfolio_id'), task.get('product_id'), task.get('side'), str(task.get('price')), str(task.get('size')), task.get('status'), task.get('[1;31mstp_id[m'))
+[35mdb_manager.py[m[36m:[m[32m99[m[36m:[m                        "UPDATE orders_registry SET status = ? WHERE [1;31mclient_order_id[m = ?", 
+[35mdb_manager.py[m[36m:[m[32m100[m[36m:[m                        (task.get('status'), task.get('[1;31mclient_order_id[m'))
+[35mdb_manager.py[m[36m:[m[32m104[m[36m:[m                        "INSERT INTO grid_trades (trade_id, [1;31mclient_order_id[m, portfolio_id, pnl, buy_price, sell_price, size, fee) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING')",
+[35mdb_manager.py[m[36m:[m[32m107[m[36m:[m                            task.get('[1;31mclient_order_id[m'), 
+[35mdb_manager.py[m[36m:[m[32m127[m[36m:[m                        "UPDATE orders_registry SET status = 'GHOST_PURGED' WHERE [1;31mclient_order_id[m = ?",
+[35mdb_manager.py[m[36m:[m[32m128[m[36m:[m                        (task.get('[1;31mclient_order_id[m'),)
+[35mdb_manager.py[m[36m:[m[32m142[m[36m:[mdef log_new_order([1;31mclient_order_id[m, pid, product_id, side, price, size, [1;31mstp_id[m):
+[35mdb_manager.py[m[36m:[m[32m144[m[36m:[m        "action": "UPSERT_ORDER", "[1;31mclient_order_id[m": [1;31mclient_order_id[m, 
+[35mdb_manager.py[m[36m:[m[32m146[m[36m:[m        "price": price, "size": size, "status": "OPEN", "[1;31mstp_id[m": [1;31mstp_id[m
+[35mdb_manager.py[m[36m:[m[32m149[m[36m:[mdef update_order_status([1;31mclient_order_id[m, status):
+[35mdb_manager.py[m[36m:[m[32m150[m[36m:[m    get_db_queue().put_nowait({"action": "UPDATE_STATUS", "[1;31mclient_order_id[m": [1;31mclient_order_id[m, "status": status})
+[35mdb_manager.py[m[36m:[m[32m152[m[36m:[mdef log_failed_order([1;31mclient_order_id[m):
+[35mdb_manager.py[m[36m:[m[32m154[m[36m:[m    update_order_status([1;31mclient_order_id[m, "FAILED")
+[35mdb_manager.py[m[36m:[m[32m156[m[36m:[mdef log_trade_pnl(trade_id, [1;31mclient_order_id[m, pid, pnl, buy_price=0, sell_price=0, size=0):
+[35mdb_manager.py[m[36m:[m[32m160[m[36m:[m        "[1;31mclient_order_id[m": [1;31mclient_order_id[m,
+[35mdb_manager.py[m[36m:[m[32m168[m[36m:[mdef purge_ghost_order([1;31mclient_order_id[m):
+[35mdb_manager.py[m[36m:[m[32m169[m[36m:[m    get_db_queue().put_nowait({"action": "PURGE_GHOSTS", "[1;31mclient_order_id[m": [1;31mclient_order_id[m})
+[35mmanager.py[m[36m:[m[32m59[m[36m:[m    def register_active_order(self, [1;31mclient_order_id[m: str, payload: dict):
+[35mmanager.py[m[36m:[m[32m61[m[36m:[m        if [1;31mclient_order_id[m in self.terminal_order_cache:
+[35mmanager.py[m[36m:[m[32m63[m[36m:[m        local_key = f"local_{[1;31mclient_order_id[m}"
+[35mmanager.py[m[36m:[m[32m123[m[36m:[m                    cid = order.get("[1;31mclient_order_id[m")
+[35mmanager.py[m[36m:[m[32m134[m[36m:[m                                "[1;31mclient_order_id[m": cid, "portfolio_id": pid, "product_id": order.get("product_id"),
+[35mmanager.py[m[36m:[m[32m143[m[36m:[m                        loc_cid = local_order.get("[1;31mclient_order_id[m")
+[35mmanager.py[m[36m:[m[32m148[m[36m:[m                    loc_cid = self.active_orders[key].get("[1;31mclient_order_id[m")
+[35mmanager.py[m[36m:[m[32m215[m[36m:[m    async def log_pnl_to_db(self, portfolio_id: str, realized_pnl: Decimal, trade_id: str, [1;31mclient_order_id[m: str = None, buy_price: str = "0", sell_price: str = "0", size: str = "0"):
+[35mmanager.py[m[36m:[m[32m217[m[36m:[m            cid_to_log = [1;31mclient_order_id[m if [1;31mclient_order_id[m else trade_id
+[35mmanager.py[m[36m:[m[32m223[m[36m:[m    async def calculate_and_sweep(self, portfolio_id: str, sell_price: str, sell_size: str, [1;31mclient_order_id[m: str = None, exchange_id: str = None):
+[35mmanager.py[m[36m:[m[32m269[m[36m:[m                        trade_id=trade_id, [1;31mclient_order_id[m=[1;31mclient_order_id[m,
+[35mmanager.py[m[36m:[m[32m277[m[36m:[m    async def _cleanup_terminal_order(self, [1;31mclient_order_id[m: str):
+[35mmanager.py[m[36m:[m[32m278[m[36m:[m        if not [1;31mclient_order_id[m: return
+[35mmanager.py[m[36m:[m[32m280[m[36m:[m        if [1;31mclient_order_id[m not in self.terminal_order_cache:
+[35mmanager.py[m[36m:[m[32m281[m[36m:[m            self.terminal_order_cache[[1;31mclient_order_id[m] = True
+[35mmanager.py[m[36m:[m[32m285[m[36m:[m        local_key = f"local_{[1;31mclient_order_id[m}"
+[35mmanager.py[m[36m:[m[32m292[m[36m:[m                if task.get("[1;31mclient_order_id[m") != [1;31mclient_order_id[m:
+[35mmanager.py[m[36m:[m[32m299[m[36m:[m                if task.get("[1;31mclient_order_id[m") != [1;31mclient_order_id[m:
+[35mmanager.py[m[36m:[m[32m317[m[36m:[m                    [1;31mclient_order_id[m = order.get("[1;31mclient_order_id[m")
+[35mmanager.py[m[36m:[m[32m322[m[36m:[m                            logger.info(f"[OrderManager] Terminal state reached for {[1;31mclient_order_id[m} ({status}: {cancel_reason}). Purging from memory.")
+[35mmanager.py[m[36m:[m[32m324[m[36m:[m                            asyncio.run_coroutine_threadsafe(self._cleanup_terminal_order([1;31mclient_order_id[m), self.loop)
+[35mmanager.py[m[36m:[m[32m329[m[36m:[m                    if [1;31mclient_order_id[m in self.processed_fills:
+[35mmanager.py[m[36m:[m[32m338[m[36m:[m                    if not [1;31mclient_order_id[m or not side or not pid:
+[35mmanager.py[m[36m:[m[32m341[m[36m:[m                    self.processed_fills.add([1;31mclient_order_id[m)
+[35mmanager.py[m[36m:[m[32m347[m[36m:[m                            asyncio.run_coroutine_threadsafe(self.calculate_and_sweep(pid, price, size, [1;31mclient_order_id[m, exchange_id), self.loop)
+[35morder_rebalancer.py[m[36m:[m[32m60[m[36m:[m            cid = o.get("[1;31mclient_order_id[m")
+[35morder_rebalancer.py[m[36m:[m[32m65[m[36m:[m            portfolio_orders.append({"order": o, "price": price, "side": side, "[1;31mclient_order_id[m": cid, "exchange_id": exchange_id})
+[35morder_rebalancer.py[m[36m:[m[32m91[m[36m:[m        keep_client_ids = {k["[1;31mclient_order_id[m"] for k in keep_candidates if k["[1;31mclient_order_id[m"]}
+[35morder_rebalancer.py[m[36m:[m[32m92[m[36m:[m        final_cancel = [p for p in to_cancel if p["[1;31mclient_order_id[m"] not in keep_client_ids]
+[35morder_rebalancer.py[m[36m:[m[32m94[m[36m:[m        pending_ids = {q.get("[1;31mclient_order_id[m") for q in getattr(order_manager, "execution_queue", []) if isinstance(q, dict)}
+[35morder_rebalancer.py[m[36m:[m[32m95[m[36m:[m        pending_ids.update({q.get("[1;31mclient_order_id[m") for q in getattr(order_manager, "priority_queue", []) if isinstance(q, dict)})
+[35morder_rebalancer.py[m[36m:[m[32m102[m[36m:[m            cid = item.get("[1;31mclient_order_id[m")
+[35morder_rebalancer.py[m[36m:[m[32m111[m[36m:[m                "[1;31mclient_order_id[m": cid,
+[35morder_rebalancer.py[m[36m:[m[32m150[m[36m:[m                    "[1;31mclient_order_id[m": f"repl-{uuid.uuid4()}",
+[35morder_rebalancer.py[m[36m:[m[32m157[m[36m:[m                    "[1;31mstp_id[m": str(uuid.uuid4())
+[35mrun.py[m[36m:[m[32m129[m[36m:[m            "[1;31mclient_order_id[m": task.get("[1;31mclient_order_id[m", str(uuid4())),
+[35mrun.py[m[36m:[m[32m139[m[36m:[m            "self_trade_prevention_id": task.get("[1;31mstp_id[m", str(uuid4())),
+[35mrun.py[m[36m:[m[32m160[m[36m:[m                    logger.info("⚡ Order %s instantly terminated by exchange (%s). Skipping memory lock.", order_payload["[1;31mclient_order_id[m"][:8], returned_status)
+[35mrun.py[m[36m:[m[32m163[m[36m:[m                    order_manager.register_active_order(order_payload["[1;31mclient_order_id[m"], {
+[35mrun.py[m[36m:[m[32m164[m[36m:[m                        "[1;31mclient_order_id[m": order_payload["[1;31mclient_order_id[m"],
+[35mrun.py[m[36m:[m[32m171[m[36m:[m                    db_manager.log_new_order(order_payload['[1;31mclient_order_id[m'], pid, task['product_id'], task['side'].upper(), str(task['price']), str(task['size']), order_payload['self_trade_prevention_id'])
+[35mrun.py[m[36m:[m[32m178[m[36m:[m        [1;31mclient_order_id[m = task.get("[1;31mclient_order_id[m")
+[35mrun.py[m[36m:[m[32m182[m[36m:[m            order_manager.active_orders.pop(f"local_{[1;31mclient_order_id[m}", None)
+[35mrun.py[m[36m:[m[32m189[m[36m:[m            order_manager.active_orders.pop(f"local_{[1;31mclient_order_id[m}", None)
+[35mrun.py[m[36m:[m[32m204[m[36m:[m        order_manager.active_orders.pop(f"local_{[1;31mclient_order_id[m}", None)
+[35mrun.py[m[36m:[m[32m207[m[36m:[m            logger.info("✅ Cancel confirmed and memory synced for: %s", str([1;31mclient_order_id[m)[:8])
+[35mrun.py[m[36m:[m[32m208[m[36m:[m            db_manager.update_order_status([1;31mclient_order_id[m, 'CANCELLED')
+[35mrun.py[m[36m:[m[32m211[m[36m:[m            db_manager.update_order_status([1;31mclient_order_id[m, 'GHOST_PURGED')
+[35mrun.py[m[36m:[m[32m507[m[36m:[m                temp_id = f"local_{row['[1;31mclient_order_id[m']}"
+[35mrun.py[m[36m:[m[32m509[m[36m:[m                    "[1;31mclient_order_id[m": row['[1;31mclient_order_id[m'], "portfolio_id": row['portfolio_id'],
+[35mstrategies/aero_aggressive_scalper.py[m[36m:[m[32m56[m[36m:[m                    "[1;31mclient_order_id[m": o.get("[1;31mclient_order_id[m"),
+[35mstrategies/aero_aggressive_scalper.py[m[36m:[m[32m77[m[36m:[m                    "[1;31mclient_order_id[m": order.get("[1;31mclient_order_id[m"),
+[35mstrategies/aero_aggressive_scalper.py[m[36m:[m[32m106[m[36m:[m                    "[1;31mclient_order_id[m": temp_client_id,
+[35mstrategies/aero_aggressive_scalper.py[m[36m:[m[32m113[m[36m:[m                    "[1;31mclient_order_id[m": temp_client_id,
+[35mstrategies/aero_aggressive_scalper.py[m[36m:[m[32m119[m[36m:[m                    "[1;31mstp_id[m": str(uuid.uuid4())
+[35mstrategies/aero_aggressive_scalper.py[m[36m:[m[32m126[m[36m:[m            [1;31mclient_order_id[m = str(uuid.uuid5(STP_NAMESPACE, f"{portfolio_id}_SELL_{formatted_price}"))
+[35mstrategies/aero_aggressive_scalper.py[m[36m:[m[32m128[m[36m:[m            if not any(o.get("[1;31mclient_order_id[m") == [1;31mclient_order_id[m for o in active_orders):
+[35mstrategies/aero_aggressive_scalper.py[m[36m:[m[32m129[m[36m:[m                order_manager.register_active_order([1;31mclient_order_id[m, {
+[35mstrategies/aero_aggressive_scalper.py[m[36m:[m[32m130[m[36m:[m                    "[1;31mclient_order_id[m": [1;31mclient_order_id[m,
+[35mstrategies/aero_aggressive_scalper.py[m[36m:[m[32m137[m[36m:[m                    "[1;31mclient_order_id[m": [1;31mclient_order_id[m,
+[35mstrategies/aero_aggressive_scalper.py[m[36m:[m[32m143[m[36m:[m                    "[1;31mstp_id[m": str(uuid.uuid5(STP_NAMESPACE, f"{portfolio_id}_STP_SELL_{formatted_price}"))
+[35mstrategies/aero_asymmetric_grid_v2.py[m[36m:[m[32m76[m[36m:[m        pending_ids = {payload.get("[1;31mclient_order_id[m") for payload in order_manager.execution_queue if payload.get("action") == "PLACE_ORDER" and payload.get("source_pid") == portfolio_id}
+[35mstrategies/aero_asymmetric_grid_v2.py[m[36m:[m[32m123[m[36m:[m            [1;31mclient_order_id[m = str(uuid.uuid5(uuid.NAMESPACE_DNS, unique_seed))
+[35mstrategies/aero_asymmetric_grid_v2.py[m[36m:[m[32m125[m[36m:[m            if [1;31mclient_order_id[m in order_manager.active_orders or [1;31mclient_order_id[m in pending_ids:
+[35mstrategies/aero_asymmetric_grid_v2.py[m[36m:[m[32m128[m[36m:[m            [1;31mstp_id[m = str(uuid.uuid5(STP_NAMESPACE, f"{portfolio_id}_{strategy_name}_{idx}"))
+[35mstrategies/aero_asymmetric_grid_v2.py[m[36m:[m[32m133[m[36m:[m                "[1;31mclient_order_id[m": [1;31mclient_order_id[m,
+[35mstrategies/aero_asymmetric_grid_v2.py[m[36m:[m[32m140[m[36m:[m                "[1;31mstp_id[m": [1;31mstp_id[m
+[35mstrategies/aero_reserves_ladder.py[m[36m:[m[32m84[m[36m:[m        active_sells = {Decimal(str(o.get("price"))): o.get("client_oid", o.get("[1;31mclient_order_id[m")) for o in active_orders if o.get("side") == "SELL"}
+[35mstrategies/aero_reserves_ladder.py[m[36m:[m[32m87[m[36m:[m            pending_ids = {payload.get("[1;31mclient_order_id[m") for payload in order_manager.execution_queue if payload.get("action") in ["PLACE_ORDER", "CANCEL_ORDER"]}
+[35mstrategies/aero_reserves_ladder.py[m[36m:[m[32m129[m[36m:[m                    "[1;31mclient_order_id[m": buy_client_id,
+[35mstrategies/aero_reserves_ladder.py[m[36m:[m[32m162[m[36m:[m                        "[1;31mclient_order_id[m": oid
+[35mstrategies/aero_reserves_ladder.py[m[36m:[m[32m181[m[36m:[m                                "[1;31mclient_order_id[m": sell_client_id,
+[35mstrategies/aero_simple_ladder.py[m[36m:[m[32m96[m[36m:[m            cid = order.get("[1;31mclient_order_id[m")
+[35mstrategies/aero_simple_ladder.py[m[36m:[m[32m99[m[36m:[m            if cid and eid and not any(p.get("[1;31mclient_order_id[m") == cid for p in pending_queue):
+[35mstrategies/aero_simple_ladder.py[m[36m:[m[32m102[m[36m:[m                    "[1;31mclient_order_id[m": cid,
+[35mstrategies/aero_simple_ladder.py[m[36m:[m[32m116[m[36m:[m        [1;31mclient_order_id[m = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{portfolio_id}_{strategy_name}_{level['side']}_{formatted_price}"))
+[35mstrategies/aero_simple_ladder.py[m[36m:[m[32m118[m[36m:[m        if any(o.get("[1;31mclient_order_id[m") == [1;31mclient_order_id[m for o in active_orders) or \
+[35mstrategies/aero_simple_ladder.py[m[36m:[m[32m119[m[36m:[m           any(p.get("[1;31mclient_order_id[m") == [1;31mclient_order_id[m for p in pending_queue):
+[35mstrategies/aero_simple_ladder.py[m[36m:[m[32m125[m[36m:[m            "[1;31mclient_order_id[m": [1;31mclient_order_id[m,
+[35mstrategies/aero_simple_ladder.py[m[36m:[m[32m132[m[36m:[m            "[1;31mstp_id[m": str(uuid.uuid5(STP_NAMESPACE, f"{portfolio_id}_{strategy_name}"))
+[35mstrategies/aero_usdc_grid.py[m[36m:[m[32m22[m[36m:[m                "[1;31mclient_order_id[m": str(uuid.uuid4()),
+[35mutils.py[m[36m:[m[32m109[m[36m:[m                    "[1;31mclient_order_id[m": api_payload.get("[1;31mclient_order_id[m"), 
+[35mutils.py[m[36m:[m[32m113[m[36m:[m                    "self_trade_prevention_id": api_payload.get("[1;31mstp_id[m") or api_payload.get("self_trade_prevention_id")

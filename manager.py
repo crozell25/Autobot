@@ -6,9 +6,14 @@ import logging
 import asyncio
 from decimal import Decimal
 from collections import deque, OrderedDict
+<<<<<<< HEAD
 from typing import Dict, Any, Optional, Deque, List
 
 from utils import safe_api_call, _normalize_to_dict
+=======
+from typing import Dict, Any, Optional
+from utils import safe_api_call, _normalize_to_dict, validate_and_quantize, would_self_match, format_by_increment
+>>>>>>> 357b415 (Finalize utils.py patch and sync with remote main)
 import db_manager
 
 logger = logging.getLogger("CoinbaseOrderManager")
@@ -41,8 +46,52 @@ class CoinbaseOrderManager:
     def _get_side(self, order: Dict[str, Any]) -> str:
         return (order.get("order_side") or order.get("side") or order.get("side_type") or "").upper()
 
+<<<<<<< HEAD
     def enqueue(self, payload: Dict[str, Any]) -> None:
         if payload.get("action") == "CANCEL_ORDER":
+=======
+    def _normalize_pid(self, payload: Dict[str, Any]) -> str:
+        return payload.get("source_pid") or payload.get("portfolio_id") or payload.get("pid")
+
+    def enqueue(self, payload: Dict[str, Any]):
+        """
+        Central enqueue for tasks. PLACE_ORDER payloads are validated and checked
+        for conservative self-match avoidance and id uniqueness here.
+        """
+        action = payload.get("action")
+        if action == "PLACE_ORDER":
+            price = payload.get("price")
+            size = payload.get("size")
+            tick_size = payload.get("tick_size") or payload.get("market_tick_size") or Decimal("0.00001")
+
+            price_q, size_d = validate_and_quantize(price, size, tick_size, format_by_increment)
+            if price_q is None:
+                return
+
+            payload["price"] = str(price_q)
+            payload["size"] = str(size_d)
+
+            if not payload.get("post_only", False):
+                payload["stp_id"] = payload.get("stp_id") or str(uuid.uuid4())
+                payload["client_order_id"] = payload.get("client_order_id") or str(uuid.uuid4())
+            else:
+                if not payload.get("client_order_id"):
+                    pid = self._normalize_pid(payload) or "unknown"
+                    payload["client_order_id"] = str(uuid.uuid5(uuid.NAMESPACE_OID, f"{pid}_{payload.get('side')}_{price_q}"))
+
+            portfolio_id = self._normalize_pid(payload)
+            product_id = payload.get("product_id")
+            active = [o for o in self.active_orders.values()
+                      if o.get("portfolio_id") == portfolio_id and o.get("product_id") == product_id]
+
+            if would_self_match(payload.get("side", ""), price_q, active):
+                logger.info("Skipping PLACE_ORDER that would self-match: pid=%s product=%s side=%s price=%s",
+                            portfolio_id[:8] if portfolio_id else 'None', product_id, payload.get("side"), price_q)
+                return
+
+        # Queue routing
+        if action in ["CANCEL_ORDER", "TRANSFER_PROFIT"]:
+>>>>>>> 357b415 (Finalize utils.py patch and sync with remote main)
             self.priority_queue.append(payload)
         else:
             self.execution_queue.append(payload)

@@ -1,0 +1,133 @@
+From 513be946b34ccfc15e54991bfb02413b91bd4fdf Mon Sep 17 00:00:00 2001
+From: crozell25 <crozell25@gmail.com>
+Date: Tue, 14 Jul 2026 18:33:58 -0400
+Subject: [PATCH] Add files via upload
+
+---
+ run.py | 62 ++++++++++++++++++++++++++++++++++++++++++++++------------
+ 1 file changed, 50 insertions(+), 12 deletions(-)
+
+diff --git a/run.py b/run.py
+index b09483c..3c17da6 100644
+--- a/run.py
++++ b/run.py
+@@ -30,11 +30,12 @@ try:
+     import strategies.aero_asymmetric_grid_v2 as aero_grid
+     import strategies.aero_reserves_ladder as aero_ladder
+     import strategies.aero_simple_ladder as aero_simple 
++    import strategies.aero_aggressive_scalper as aero_scalper
+ except ImportError as e:
+     aero_grid = None
+     aero_ladder = None
+     aero_simple = None 
+-
++    aero_scalper = None
+ load_dotenv()
+ 
+ if sys.platform == "win32":
+@@ -104,6 +105,11 @@ def route_strategy(portfolio_name, pid, order_manager, market_data):
+     elif (name_upper.startswith("AERO RESERVE") or name_upper.startswith("RESERVE")) and aero_ladder:
+         try: aero_ladder.run_strategy(order_manager, market_data)
+         except Exception as e: logger.exception("Strategy error (reserve): %s", e)
++    elif name_upper.startswith("SCALP") and aero_scalper: # New assignment
++        logger.info(f"➡️ Routing '{portfolio_name}' to Aggressive Scalper Strategy...")
++        try: aero_scalper.run_strategy(order_manager, market_data)
++        except Exception as e: logger.exception("Strategy error (scalper): %s", e)
++
+     elif name_upper.startswith("STRAT"):
+         if aero_simple is None: return
+         logger.info(f"➡️ Routing '{portfolio_name}' to Simple Ladder Strategy...")
+@@ -247,7 +253,11 @@ async def process_execution_queue():
+     while True:
+         batch = await order_manager.drain_execution_queue(limit=5)
+         if batch:
+-            await asyncio.gather(*(execute_single_task(task) for task in batch))
++            # FIX: Gather with exceptions isolated
++            results = await asyncio.gather(*(execute_single_task(task) for task in batch), return_exceptions=True)
++            for r in results:
++                if isinstance(r, Exception):
++                    logger.error("Execution task failed: %s", r, exc_info=True)
+             await asyncio.sleep(0.5) 
+         else:
+             await asyncio.sleep(1)
+@@ -407,20 +417,17 @@ async def autonomous_trading_loop():
+                                     acc_pid = acc.get("retail_portfolio_id", "UNKNOWN")
+                                     currency = acc.get("currency")
+                                     avail = Decimal(str(acc.get("available_balance", {}).get("value", "0")))
+-                                    hold = Decimal(str(acc.get("hold", {}).get("value", "0")))
+                                 else:
+                                     acc_pid = getattr(acc, 'retail_portfolio_id', "UNKNOWN")
+                                     currency = getattr(acc, 'currency', None)
+                                     avail = Decimal(str(getattr(acc.available_balance, 'value', '0')))
+-                                    hold = Decimal(str(getattr(acc.hold, 'value', '0')))
+-                                
+-                                total_val = avail + hold
+                                 
+                                 if acc_pid not in portfolio_balances:
+                                     portfolio_balances[acc_pid] = {"AERO": "0", "USDC": "0"}
+                                 
+                                 if currency == "AERO":
+-                                    portfolio_balances[acc_pid]["AERO"] = str(total_val)
++                                    # TELEMETRY FIX: Strict available balance, dropping held capital
++                                    portfolio_balances[acc_pid]["AERO"] = str(avail)
+                                 elif currency == "USDC":
+                                     portfolio_balances[acc_pid]["USDC"] = str(avail)
+ 
+@@ -428,18 +435,49 @@ async def autonomous_trading_loop():
+                         logger.warning("Failed to fetch balances for %s: %s", name, e)
+ 
+                     balances = portfolio_balances.get(pid, {"AERO": "0", "USDC": "0"})
+-                    aero_bal = balances.get("AERO", "0")
+-                    usdc_bal = balances.get("USDC", "0")
++                    aero_avail = Decimal(balances.get("AERO", "0"))
++                    usdc_avail = Decimal(balances.get("USDC", "0"))
++
++                    # --- LOCAL QUEUE RESERVATION SYSTEM ---
++                    # Deduct funds already committed in the execution queues to prevent double-spending
++                    reserved_aero = Decimal("0")
++                    reserved_usdc = Decimal("0")
++                    
++                    try:
++                        queued_tasks = list(order_manager.priority_queue) + list(order_manager.execution_queue)
++                        for task in queued_tasks:
++                            if task.get("action") == "PLACE_ORDER" and (task.get("source_pid") == pid or task.get("portfolio_id") == pid):
++                                side = task.get("side", "").upper()
++                                try:
++                                    size_dec = Decimal(str(task.get("size", "0")))
++                                    price_dec = Decimal(str(task.get("price", "0")))
++                                    
++                                    if side == "SELL":
++                                        reserved_aero += size_dec
++                                    elif side == "BUY":
++                                        # Size is base size, price is quote price. Total quote required = size * price
++                                        reserved_usdc += (size_dec * price_dec)
++                                except Exception:
++                                    pass
++                    except Exception as e:
++                        logger.warning("Queue parsing error: %s", e)
++
++                    aero_effective = max(Decimal("0"), aero_avail - reserved_aero)
++                    usdc_effective = max(Decimal("0"), usdc_avail - reserved_usdc)
+ 
+-                    logger.info("Telemetry [%s] -> Price: %s | AERO: %s | USDC: %s | Queue: %d",
+-                                name[:8], order_manager.live_ticker_price, aero_bal, usdc_bal, len(order_manager.execution_queue))
++                    logger.info("Telemetry [%s] -> Price: %s | AERO: %s (Eff: %s) | USDC: %s (Eff: %s) | Queue: %d",
++                                name[:8], order_manager.live_ticker_price, 
++                                aero_avail, aero_effective, usdc_avail, usdc_effective, 
++                                len(order_manager.execution_queue))
+ 
+                     market_context = {
+                         "price": order_manager.live_ticker_price,
+                         "current_price": order_manager.live_ticker_price,
+                         "live_price": order_manager.live_ticker_price,
+                         "timestamp": asyncio.get_event_loop().time(),
+-                        "portfolio_id": pid, "aero_bal": aero_bal, "usdc_bal": usdc_bal,
++                        "portfolio_id": pid, 
++                        "aero_bal": str(aero_effective), # Passing safe bounds to the strategy bots
++                        "usdc_bal": str(usdc_effective),
+                     }
+ 
+                     try:
+-- 
+2.55.0.windows.2
+

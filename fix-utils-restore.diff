@@ -1,0 +1,82 @@
+diff --git a/utils.py b/utils.py
+index 0000000..1111111 100644
+--- a/utils.py
++++ b/utils.py
+@@ -1,6 +1,24 @@
+ import os
+ import time
+ import logging
++from urllib.parse import urlparse
+ import asyncio
+ import requests
+ import json
+ from decimal import Decimal, ROUND_DOWN
+ from typing import Any, Dict, Optional
++from decimal import InvalidOperation
++
++logger = logging.getLogger(__name__)
++
++def _normalize_to_dict(obj: Any) -> Dict:
++    if obj is None:
++        return {}
++    if isinstance(obj, dict):
++        return obj
++    if isinstance(obj, str):
++        s = obj.strip()
++        if not s:
++            return {}
++        try:
++            parsed = json.loads(s)
++            return parsed if isinstance(parsed, dict) else {"value": parsed}
++        except Exception:
++            return {"value": s}
++    try:
++        return dict(obj)
++    except Exception:
++        return {"value": str(obj)}
+@@
+ def format_by_increment(value: Any, increment: Any) -> str:
+     """
+     Format a numeric value according to a tick increment.
+@@
+     except Exception as e:
+         logger.warning("format_by_increment failed for value=%s increment=%s: %s", value, increment, e)
+         return str(value)
++
++def validate_and_quantize(price, size, tick_size, format_by_increment_fn):
++    """
++    Validate numeric order params and quantize price to tick_size.
++    Returns (Decimal(price_q), Decimal(size_d)) or (None, None) on invalid input.
++    """
++    try:
++        price_d = price if isinstance(price, Decimal) else Decimal(str(price))
++        size_d = size if isinstance(size, Decimal) else Decimal(str(size))
++    except (InvalidOperation, TypeError, ValueError):
++        logger.warning("Rejecting order: invalid numeric params price=%s size=%s", price, size)
++        return None, None
++    if price_d <= 0 or size_d <= 0:
++        logger.warning("Rejecting order: non-positive price/size price=%s size=%s", price_d, size_d)
++        return None, None
++    try:
++        price_q = Decimal(format_by_increment_fn(price_d, tick_size))
++    except Exception:
++        logger.exception("Quantize failed for price=%s tick=%s", price_d, tick_size)
++        return None, None
++    return price_q, size_d
++
++def would_self_match(side: str, price_q: Decimal, active_orders: list) -> bool:
++    """
++    Conservative check: returns True if placing `side` at price_q would match an existing opposite order.
++    active_orders is a list of order dicts for the same portfolio/product.
++    """
++    from decimal import Decimal as _D
++    if side == "BUY":
++        return any(
++            o for o in active_orders
++            if o.get("side") == "SELL" and _D(str(o.get("price", "0"))) <= price_q
++        )
++    return any(
++        o for o in active_orders
++        if o.get("side") == "BUY" and _D(str(o.get("price", "0"))) >= price_q
++    )
+
