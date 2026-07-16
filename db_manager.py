@@ -209,3 +209,385 @@ def emergency_clean_db():
 
 if __name__ == "__main__":
     emergency_clean_db()
+# --- Async Query Helpers ---
+
+async def get_open_orders(portfolio_id: str):
+    """Fetch all OPEN orders for a given portfolio."""
+    try:
+        async with aiosqlite.connect("trading_bot.db") as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM orders_registry WHERE portfolio_id = ? AND status = 'OPEN'",
+                (portfolio_id,)
+            )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+    except Exception as e:
+        logger.error(f"Failed to fetch open orders for {portfolio_id}: {e}")
+        return []
+
+async def get_recent_trades(limit: int = 50):
+    """Retrieve the most recent trades across all portfolios."""
+    try:
+        async with aiosqlite.connect("trading_bot.db") as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM grid_trades ORDER BY timestamp DESC LIMIT ?",
+                (limit,)
+            )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+    except Exception as e:
+        logger.error(f"Failed to fetch recent trades: {e}")
+        return []
+
+async def get_portfolio_state(portfolio_id: str):
+    """Get the latest balance snapshot for a portfolio."""
+    try:
+        async with aiosqlite.connect("trading_bot.db") as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT aero_balance, usdc_balance, timestamp
+                FROM portfolio_state
+                WHERE portfolio_id = ?
+                ORDER BY timestamp DESC LIMIT 1
+                """,
+                (portfolio_id,)
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+    except Exception as e:
+        logger.error(f"Failed to fetch portfolio state for {portfolio_id}: {e}")
+        return None
+
+
+# --- Async Query Helpers ---
+
+async def get_open_orders(portfolio_id: str):
+    """Fetch all OPEN orders for a given portfolio."""
+    try:
+        async with aiosqlite.connect("trading_bot.db") as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM orders_registry WHERE portfolio_id = ? AND status = 'OPEN'",
+                (portfolio_id,)
+            )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+    except Exception as e:
+        logger.error(f"Failed to fetch open orders for {portfolio_id}: {e}")
+        return []
+
+async def get_recent_trades(limit: int = 50):
+    """Retrieve the most recent trades across all portfolios."""
+    try:
+        async with aiosqlite.connect("trading_bot.db") as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM grid_trades ORDER BY timestamp DESC LIMIT ?",
+                (limit,)
+            )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+    except Exception as e:
+        logger.error(f"Failed to fetch recent trades: {e}")
+        return []
+
+async def get_portfolio_state(portfolio_id: str):
+    """Get the latest balance snapshot for a portfolio."""
+    try:
+        async with aiosqlite.connect("trading_bot.db") as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT aero_balance, usdc_balance, timestamp
+                FROM portfolio_state
+                WHERE portfolio_id = ?
+                ORDER BY timestamp DESC LIMIT 1
+                """,
+                (portfolio_id,)
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+    except Exception as e:
+        logger.error(f"Failed to fetch portfolio state for {portfolio_id}: {e}")
+        return None
+
+# --- Async Insert/Update Helpers ---
+
+async def record_portfolio_state(portfolio_id: str, aero_balance: float, usdc_balance: float):
+    """Log a new portfolio balance snapshot."""
+    try:
+        async with aiosqlite.connect("trading_bot.db") as db:
+            await db.execute(
+                "INSERT INTO portfolio_state (portfolio_id, aero_balance, usdc_balance) VALUES (?, ?, ?)",
+                (portfolio_id, str(aero_balance), str(usdc_balance))
+            )
+            await db.commit()
+            logger.info(f"📊 Portfolio state recorded for {portfolio_id}: AERO={aero_balance}, USDC={usdc_balance}")
+    except Exception as e:
+        logger.error(f"Failed to record portfolio state for {portfolio_id}: {e}")
+
+async def update_order_price(client_order_id: str, new_price: float):
+    """Update the price of an existing order."""
+    try:
+        async with aiosqlite.connect("trading_bot.db") as db:
+            await db.execute(
+                "UPDATE orders_registry SET price = ? WHERE client_order_id = ?",
+                (str(new_price), client_order_id)
+            )
+            await db.commit()
+            logger.info(f"💰 Updated price for order {client_order_id}: {new_price}")
+    except Exception as e:
+        logger.error(f"Failed to update price for order {client_order_id}: {e}")
+
+async def mark_trade_completed(trade_id: str):
+    """Mark a trade as completed and reconcile its fee if pending."""
+    try:
+        async with aiosqlite.connect("trading_bot.db") as db:
+            await db.execute(
+                "UPDATE grid_trades SET fee = 'SETTLED' WHERE trade_id = ? AND fee = 'PENDING'",
+                (trade_id,)
+            )
+            await db.commit()
+            logger.info(f"✅ Trade {trade_id} marked as completed.")
+    except Exception as e:
+        logger.error(f"Failed to mark trade {trade_id} as completed: {e}")
+
+# --- Async Analytics Helpers ---
+
+async def get_total_realized_pnl(portfolio_id: str):
+    """Calculate total realized PnL for a portfolio."""
+    try:
+        async with aiosqlite.connect("trading_bot.db") as db:
+            cursor = await db.execute(
+                "SELECT SUM(net_pnl) FROM grid_trades WHERE portfolio_id = ? AND fee = 'SETTLED'",
+                (portfolio_id,)
+            )
+            result = await cursor.fetchone()
+            return float(result[0]) if result and result[0] is not None else 0.0
+    except Exception as e:
+        logger.error(f"Failed to calculate total realized PnL for {portfolio_id}: {e}")
+        return 0.0
+
+async def get_average_trade_size(portfolio_id: str):
+    """Compute average trade size for a portfolio."""
+    try:
+        async with aiosqlite.connect("trading_bot.db") as db:
+            cursor = await db.execute(
+                "SELECT AVG(size) FROM grid_trades WHERE portfolio_id = ?",
+                (portfolio_id,)
+            )
+            result = await cursor.fetchone()
+            return float(result[0]) if result and result[0] is not None else 0.0
+    except Exception as e:
+        logger.error(f"Failed to compute average trade size for {portfolio_id}: {e}")
+        return 0.0
+
+async def get_portfolio_performance_summary(portfolio_id: str):
+    """Return a summary of portfolio performance metrics."""
+    try:
+        async with aiosqlite.connect("trading_bot.db") as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT 
+                    COUNT(*) AS total_trades,
+                    SUM(net_pnl) AS total_pnl,
+                    AVG(size) AS avg_size,
+                    MIN(timestamp) AS first_trade,
+                    MAX(timestamp) AS last_trade
+                FROM grid_trades
+                WHERE portfolio_id = ?
+                """,
+                (portfolio_id,)
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row else {}
+    except Exception as e:
+        logger.error(f"Failed to generate performance summary for {portfolio_id}: {e}")
+        return {}
+
+# --- Async Dashboard Aggregation Helpers ---
+
+async def get_daily_pnl_trend(portfolio_id: str, days: int = 7):
+    """Return daily total PnL for the last N days."""
+    try:
+        async with aiosqlite.connect("trading_bot.db") as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT DATE(timestamp) AS day, SUM(net_pnl) AS total_pnl
+                FROM grid_trades
+                WHERE portfolio_id = ? AND fee = 'SETTLED'
+                GROUP BY day
+                ORDER BY day DESC
+                LIMIT ?
+                """,
+                (portfolio_id, days)
+            )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+    except Exception as e:
+        logger.error(f"Failed to fetch daily PnL trend for {portfolio_id}: {e}")
+        return []
+
+async def get_trade_frequency_by_hour(portfolio_id: str):
+    """Count trades grouped by hour of day."""
+    try:
+        async with aiosqlite.connect("trading_bot.db") as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT STRFTIME('%H', timestamp) AS hour, COUNT(*) AS trade_count
+                FROM grid_trades
+                WHERE portfolio_id = ?
+                GROUP BY hour
+                ORDER BY hour
+                """,
+                (portfolio_id,)
+            )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+    except Exception as e:
+        logger.error(f"Failed to compute trade frequency by hour for {portfolio_id}: {e}")
+        return []
+
+async def get_rolling_avg_pnl(portfolio_id: str, window: int = 10):
+    """Compute rolling average PnL over the last N trades."""
+    try:
+        async with aiosqlite.connect("trading_bot.db") as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT trade_id, net_pnl
+                FROM grid_trades
+                WHERE portfolio_id = ? AND fee = 'SETTLED'
+                ORDER BY timestamp DESC
+                LIMIT ?
+                """,
+                (portfolio_id, window)
+            )
+            rows = await cursor.fetchall()
+            if not rows:
+                return 0.0
+            pnl_values = [float(row["net_pnl"]) for row in rows if row["net_pnl"] is not None]
+            return sum(pnl_values) / len(pnl_values) if pnl_values else 0.0
+    except Exception as e:
+        logger.error(f"Failed to compute rolling average PnL for {portfolio_id}: {e}")
+        return 0.0
+# --- Chart.js‑Ready JSON Formatting Helpers ---
+
+import json
+
+async def format_daily_pnl_for_chart(portfolio_id: str, days: int = 7):
+    """Return daily PnL trend formatted for Chart.js line chart."""
+    data = await get_daily_pnl_trend(portfolio_id, days)
+    labels = [row["day"] for row in reversed(data)]
+    values = [float(row["total_pnl"]) for row in reversed(data)]
+    chart_json = {
+        "labels": labels,
+        "datasets": [{
+            "label": f"{portfolio_id} Daily PnL",
+            "data": values,
+            "borderColor": "#4CAF50",
+            "backgroundColor": "rgba(76,175,80,0.2)",
+            "fill": True,
+            "tension": 0.3
+        }]
+    }
+    return json.dumps(chart_json)
+
+async def format_trade_frequency_for_chart(portfolio_id: str):
+    """Return hourly trade frequency formatted for Chart.js bar chart."""
+    data = await get_trade_frequency_by_hour(portfolio_id)
+    labels = [row["hour"] for row in data]
+    values = [row["trade_count"] for row in data]
+    chart_json = {
+        "labels": labels,
+        "datasets": [{
+            "label": f"{portfolio_id} Trades per Hour",
+            "data": values,
+            "backgroundColor": "#2196F3"
+        }]
+    }
+    return json.dumps(chart_json)
+
+async def format_rolling_avg_pnl_for_chart(portfolio_id: str, window: int = 10):
+    """Return rolling average PnL formatted for Chart.js gauge or single‑value display."""
+    avg_pnl = await get_rolling_avg_pnl(portfolio_id, window)
+    chart_json = {
+        "label": f"{portfolio_id} Rolling Avg PnL ({window} trades)",
+        "value": avg_pnl,
+        "color": "#FFC107" if avg_pnl >= 0 else "#F44336"
+    }
+    return json.dumps(chart_json)
+
+# --- FastAPI Dashboard Endpoints ---
+
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+
+app = FastAPI(title="Trading Bot Analytics API")
+
+@app.get("/api/pnl/daily/{portfolio_id}")
+async def daily_pnl_chart(portfolio_id: str, days: int = 7):
+    """Serve daily PnL trend for Chart.js line chart."""
+    chart_json = await format_daily_pnl_for_chart(portfolio_id, days)
+    return JSONResponse(content=json.loads(chart_json))
+
+@app.get("/api/trades/frequency/{portfolio_id}")
+async def trade_frequency_chart(portfolio_id: str):
+    """Serve hourly trade frequency for Chart.js bar chart."""
+    chart_json = await format_trade_frequency_for_chart(portfolio_id)
+    return JSONResponse(content=json.loads(chart_json))
+
+@app.get("/api/pnl/rolling/{portfolio_id}")
+async def rolling_avg_pnl_chart(portfolio_id: str, window: int = 10):
+    """Serve rolling average PnL for Chart.js gauge or summary card."""
+    chart_json = await format_rolling_avg_pnl_for_chart(portfolio_id, window)
+    return JSONResponse(content=json.loads(chart_json))
+
+@app.get("/api/summary/{portfolio_id}")
+async def portfolio_summary(portfolio_id: str):
+    """Serve portfolio performance summary."""
+    summary = await get_portfolio_performance_summary(portfolio_id)
+    return JSONResponse(content=summary)
+
+# --- Socket.IO Real‑Time Emitters ---
+
+import socketio
+
+# Create an async Socket.IO server
+sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
+app = socketio.ASGIApp(sio, app)
+
+@sio.event
+async def connect(sid, environ):
+    logger.info(f"🔌 Dashboard connected: {sid}")
+
+@sio.event
+async def disconnect(sid):
+    logger.info(f"❎ Dashboard disconnected: {sid}")
+
+# Emit updates when new trades or portfolio states are logged
+async def emit_trade_update(portfolio_id: str):
+    """Push latest trade and PnL data to dashboard."""
+    daily_pnl = await get_daily_pnl_trend(portfolio_id, days=7)
+    rolling_avg = await get_rolling_avg_pnl(portfolio_id, window=10)
+    summary = await get_portfolio_performance_summary(portfolio_id)
+    payload = {
+        "portfolio_id": portfolio_id,
+        "daily_pnl": daily_pnl,
+        "rolling_avg": rolling_avg,
+        "summary": summary
+    }
+    await sio.emit("trade_update", payload)
+    logger.info(f"📡 Emitted trade update for {portfolio_id}")
+
+async def emit_portfolio_state_update(portfolio_id: str):
+    """Push latest portfolio balance snapshot to dashboard."""
+    state = await get_portfolio_state(portfolio_id)
+    await sio.emit("portfolio_state_update", {"portfolio_id": portfolio_id, "state": state})
+    logger.info(f"📡 Emitted portfolio state update for {portfolio_id}")
