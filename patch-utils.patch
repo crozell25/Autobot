@@ -1,0 +1,261 @@
+*** Begin Patch
+*** Update File: utils.py
+@@
+ def _normalize_to_dict(payload: Any) -> Dict[str, Any]:
+-    if payload is None: return {}
+-    if isinstance(payload, dict): return payload
+-    if isinstance(payload, str):
+-        try: return json.loads(payload)
+-        except Exception: return {"raw": payload}
+-    if hasattr(payload, "__dict__"):
+-        try: return dict(payload.__dict__)
+-        except Exception: return {"raw": str(payload)}
+-    return {"raw": str(payload)}
++    """
++    Normalize many possible response shapes into a dict for downstream checks.
++    Handles: dict, JSON string, requests.Response-like, SDK objects with .to_dict()/.json(),
++    objects with success_response/error_response attributes, and plain objects.
++    """
++    if payload is None:
++        return {}
++    # Already a dict
++    if isinstance(payload, dict):
++        return payload
++
++    # requests.Response-like objects
++    try:
++        status = getattr(payload, "status_code", None)
++        if status is not None:
++            try:
++                return payload.json()
++            except Exception:
++                return {"status_code": status, "text": getattr(payload, "text", str(payload))}
++    except Exception:
++        pass
++
++    # Objects exposing to_dict / toJSON / json
++    try:
++        if hasattr(payload, "to_dict"):
++            return payload.to_dict()
++        if hasattr(payload, "toJSON"):
++            try:
++                return json.loads(payload.toJSON())
++            except Exception:
++                pass
++        if hasattr(payload, "json") and callable(payload.json):
++            try:
++                return payload.json()
++            except Exception:
++                pass
++    except Exception:
++        pass
++
++    # SDK-specific shapes: success_response / error_response
++    try:
++        sr = getattr(payload, "success_response", None)
++        er = getattr(payload, "error_response", None)
++        if sr or er:
++            out = {}
++            if sr:
++                if hasattr(sr, "to_dict"):
++                    out["success_response"] = sr.to_dict()
++                elif isinstance(sr, dict):
++                    out["success_response"] = sr
++                else:
++                    out["success_response"] = _normalize_to_dict(sr)
++            if er:
++                if hasattr(er, "to_dict"):
++                    out["error_response"] = er.to_dict()
++                elif isinstance(er, dict):
++                    out["error_response"] = er
++                else:
++                    out["error_response"] = _normalize_to_dict(er)
++            if hasattr(payload, "success"):
++                out["success"] = getattr(payload, "success")
++            return out
++    except Exception:
++        pass
++
++    # Fallback: try to extract attributes into a dict
++    if hasattr(payload, "__dict__"):
++        try:
++            return dict(payload.__dict__)
++        except Exception:
++            pass
++
++    # Last resort: return raw string
++    return {"raw": str(payload)}
+@@
+ def format_by_increment(value: Any, increment: Any) -> str:
+     try:
+         val = value if isinstance(value, Decimal) else Decimal(str(value))
+         inc = increment if isinstance(increment, Decimal) else Decimal(str(increment))
+-        exponent = inc.normalize().as_tuple().exponent
+-        quant = Decimal(f"1e{exponent}")
+-        if exponent > 0: return str(int(val))
+-        quantized = val.quantize(quant, rounding=ROUND_DOWN)
+-        decimals = abs(exponent)
+-        return f"{quantized:.{decimals}f}"
++        # Guard against zero increment
++        if inc == 0:
++            return str(val)
++        exponent = inc.normalize().as_tuple().exponent
++        quant = Decimal(f"1e{exponent}")
++        if exponent > 0:
++            return str(int(val))
++        quantized = val.quantize(quant, rounding=ROUND_DOWN)
++        decimals = abs(exponent)
++        return f"{quantized:.{decimals}f}"
+     except Exception as e:
+         logger.warning("format_by_increment failed for value=%s increment=%s: %s", value, increment, e)
+         return str(value)
+@@
+ async def safe_api_call(
+     client: Any,
+     method: str,
+     endpoint: str,
+     payload: Optional[Dict[str, Any]] = None,
+     timeout: float = 10.0,
+ ) -> Dict[str, Any]:
+     method = method.upper()
+     payload = payload or {}
+ 
+     try:
+-        # FIREWALL: Block Forbidden Active Status Queries
+-        if method == "GET" and "historical/batch" in endpoint:
+-            status_val = payload.get("order_status") or payload.get("status")
+-            if status_val:
+-                statuses = status_val if isinstance(status_val, list) else [s.strip().upper() for s in str(status_val).split(',')]
+-                if any(s in ["OPEN", "PENDING"] for s in statuses):
+-                    logger.warning("??? Firewall intercepted forbidden REST query for active statuses. Aborting network call.")
+-                    return {"success": False, "response": None, "error": "Query request does not support querying active status orders"}
+-
+-        # GET requests
+-        if method == "GET":
+-            params: Dict[str, Any] = {}
+-            for key, value in payload.items():
+-                if isinstance(value, list):
+-                    params[key] = value
+-                else:
+-                    params[key] = value
+-
+-            async def _do_get():
+-                return client.get(endpoint, params=params)
+-
+-            raw = await asyncio.wait_for(_do_get(), timeout=timeout)
+-
+-        # POST requests
+-        elif method == "POST":
+-            async def _do_post():
+-                # The SDK client.post() requires kwargs unwrapping, NOT json=
+-                return client.post(endpoint, **payload)
+-
+-            raw = await asyncio.wait_for(_do_post(), timeout=timeout)
+-
+-        else:
+-            return {"success": False, "response": None, "error": f"Unsupported method {method}"}
+-
+-        if raw is None:
+-            return {"success": False, "response": None, "error": "Empty response"}
+-
+-        normalized = _normalize_to_dict(raw)
+-
+-        if "error" in normalized or "error_details" in normalized:
+-            logger.error("API Call failed [%s %s]: %s", method, endpoint, normalized)
+-            return {
+-                "success": False,
+-                "response": None,
+-                "error": normalized.get("error_details") or normalized.get("error") or "Unknown error",
+-            }
+-
+-        return {"success": True, "response": normalized, "error": None}
+-
+-    except asyncio.TimeoutError:
+-        logger.error("API timeout [%s %s]", method, endpoint)
+-        return {"success": False, "response": None, "error": "Timeout"}
+-    except Exception as e:
+-        logger.error("API exception [%s %s]: %s", method, endpoint, e, exc_info=True)
+-        return {"success": False, "response": None, "error": str(e)}
++        # Helper to extract order_status robustly
++        def _extract_status_val(p):
++            if not p:
++                return None
++            if isinstance(p, dict):
++                return p.get("order_status") or p.get("status")
++            return p
++
++        # FIREWALL: Block Forbidden Active Status Queries (robust)
++        if method == "GET" and "historical/batch" in endpoint:
++            status_val = _extract_status_val(payload)
++            if status_val:
++                if isinstance(status_val, (list, tuple)):
++                    statuses = [str(s).strip().upper() for s in status_val]
++                else:
++                    statuses = [s.strip().upper() for s in str(status_val).split(",")]
++                if any(s in ("OPEN", "PENDING") for s in statuses):
++                    logger.warning("??? Firewall intercepted forbidden REST query for active statuses. Aborting network call.")
++                    return {"success": False, "response": None, "error": "Query request does not support querying active status orders", "status": 400}
++
++        # Threaded call wrappers capture SDK exceptions inside the thread
++        def _threaded_get():
++            try:
++                return client.get(endpoint, params=payload)
++            except Exception as exc:
++                return exc
++
++        def _threaded_post():
++            try:
++                if isinstance(payload, dict):
++                    return client.post(endpoint, **payload)
++                return client.post(endpoint, payload)
++            except Exception as exc:
++                return exc
++
++        # Execute the call in a thread with timeout
++        if method == "GET":
++            raw = await asyncio.wait_for(asyncio.to_thread(_threaded_get), timeout=timeout)
++        elif method == "POST":
++            raw = await asyncio.wait_for(asyncio.to_thread(_threaded_post), timeout=timeout)
++        else:
++            return {"success": False, "response": None, "error": f"Unsupported method {method}", "status": None}
++
++        # If the thread returned an exception, raise it here to be handled uniformly
++        if isinstance(raw, Exception):
++            raise raw
++
++        if raw is None:
++            return {"success": False, "response": None, "error": "Empty response", "status": None}
++
++        normalized = _normalize_to_dict(raw)
++
++        # Detect common SDK error shapes
++        if isinstance(normalized, dict):
++            if "success" in normalized and not normalized.get("success"):
++                err = normalized.get("error_details") or normalized.get("error") or normalized.get("error_response") or normalized.get("message")
++                return {"success": False, "response": None, "error": err or "API reported failure", "status": normalized.get("status_code")}
++
++            if "error_response" in normalized and normalized.get("error_response"):
++                err = normalized.get("error_response")
++                if isinstance(err, dict):
++                    err_msg = err.get("message") or json.dumps(err)
++                else:
++                    err_msg = str(err)
++                return {"success": False, "response": None, "error": err_msg, "status": normalized.get("status_code")}
++
++            return {"success": True, "response": normalized, "error": None, "status": normalized.get("status_code")}
++
++        return {"success": True, "response": normalized, "error": None, "status": None}
++
++    except asyncio.TimeoutError:
++        logger.error("API timeout [%s %s]", method, endpoint)
++        return {"success": False, "response": None, "error": "Timeout", "status": None}
++    except Exception as e:
++        logger.error("API exception [%s %s]: %s", method, endpoint, e, exc_info=True)
++        status = None
++        try:
++            status = getattr(e, "response", None) and getattr(e.response, "status_code", None)
++        except Exception:
++            status = None
++        return {"success": False, "response": None, "error": str(e), "status": status}
+*** End Patch
+

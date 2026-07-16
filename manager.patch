@@ -1,0 +1,285 @@
+From 513be946b34ccfc15e54991bfb02413b91bd4fdf Mon Sep 17 00:00:00 2001
+From: crozell25 <crozell25@gmail.com>
+Date: Tue, 14 Jul 2026 18:33:58 -0400
+Subject: [PATCH] Add files via upload
+
+---
+ manager.py | 126 ++++++++++++++++++++++++++++++++++++-----------------
+ 1 file changed, 86 insertions(+), 40 deletions(-)
+
+diff --git a/manager.py b/manager.py
+index d3e0868..4945d47 100644
+--- a/manager.py
++++ b/manager.py
+@@ -4,12 +4,11 @@ import os
+ import json
+ import logging
+ import asyncio
+-import collections
+ from decimal import Decimal
+-from collections import deque
++from collections import deque, OrderedDict
+ from typing import Dict, Any, Optional
+ 
+-from utils import safe_api_call
++from utils import safe_api_call, _normalize_to_dict
+ import db_manager
+ 
+ logger = logging.getLogger("CoinbaseOrderManager")
+@@ -20,54 +19,70 @@ class CoinbaseOrderManager:
+         self.processed_fills = set() 
+         self.clients = portfolio_clients
+         self.active_orders: Dict[str, Dict[str, Any]] = {}
++        
++        # Action-Based Priority Queuing (Cancellations jump the line)
++        self.priority_queue: deque = deque()
+         self.execution_queue: deque = deque()
++        
+         self.cost_basis_ledger: Dict[str, deque] = {pid: deque() for pid in portfolio_clients}
+-        self.ledger_lock = asyncio.Lock()
++        
++        # Portfolio-Specific Ledger Locks (Lazy Loaded)
++        self.ledger_locks: Dict[str, asyncio.Lock] = {}
++        
+         self._queue_lock = asyncio.Lock()
+         self.live_ticker_price = Decimal("0")
+         self.total_dust_swept = 0
+         self.realized_gains_history = []
+         self.profits_portfolio_id = os.getenv("PROFITS_PORTFOLIO_ID", "ca3e8f25-8dd3-4a58-89b4-884d2e10519b")
+         self.loop = None
+-        # Cache to prevent REST threads from resurrecting orders killed by WS race conditions
+-        self.terminal_order_cache = deque(maxlen=5000) 
++        
++        # O(1) Lookups for WebSocket/REST synchronization
++        self.terminal_order_cache = OrderedDict()
++        self.CACHE_MAX_SIZE = 5000 
++
++    def _ensure_lock(self, portfolio_id: str):
++        """Lazy creation helper to attach asyncio.Lock safely within the running loop."""
++        if portfolio_id not in self.ledger_locks:
++            self.ledger_locks[portfolio_id] = asyncio.Lock()
++
++    def _get_side(self, order: Dict[str, Any]) -> str:
++        """Helper to extract order side robustly across variable websocket/REST payloads."""
++        return (order.get("order_side") or order.get("side") or order.get("side_type") or "").upper()
+ 
+     def enqueue(self, payload: Dict[str, Any]):
+-        """Synchronous thread-safe enqueue."""
+-        self.execution_queue.append(payload)
++        """Synchronous thread-safe enqueue. Route cancellations to priority channel."""
++        if payload.get("action") == "CANCEL_ORDER":
++            self.priority_queue.append(payload)
++        else:
++            self.execution_queue.append(payload)
+ 
+     def register_active_order(self, client_order_id: str, payload: dict):
+-        """Thread-safe injection of new orders, protected by terminal cache."""
++        """Thread-safe injection of new tracking parameters, protected by the terminal cache."""
+         if client_order_id in self.terminal_order_cache:
+             return
+         local_key = f"local_{client_order_id}"
+         self.active_orders[local_key] = payload
+ 
+     async def prime_ledger(self):
+-        async with self.ledger_lock:
+-            logger.info("Priming FIFO ledger with historical fill data...")
+-            for pid, client in self.clients.items():
++        """Priming sequence to populate FIFO state histories with historical fills on boot."""
++        logger.info("Priming FIFO ledger with historical fill data...")
++        for pid, client in self.clients.items():
++            self._ensure_lock(pid)
++            async with self.ledger_locks[pid]:
+                 try:
+-                    data = None
+-                    if hasattr(client, "list_fills"):
+-                        try:
+-                            resp = await asyncio.to_thread(client.list_fills, product_id="AERO-USDC")
+-                            data = resp if isinstance(resp, dict) else (resp.json() if hasattr(resp, 'json') else None)
+-                        except Exception:
+-                            data = None
+-                    else:
+-                        api_res = await safe_api_call(client, "GET", "/api/v3/brokerage/orders/historical/fills", {"product_id": "AERO-USDC"})
+-                        data = api_res.get("response")
++                    api_res = await safe_api_call(client, "GET", "/api/v3/brokerage/orders/historical/fills", {"product_id": "AERO-USDC"})
++                    data = api_res.get("response")
+ 
+                     if not data or not isinstance(data, dict):
+                         continue
+ 
+-                    fills = data.get("fills", []) or data.get("data", {}).get("fills", []) or []
++                    fills = data.get("fills") or data.get("items") or data.get("data", {}).get("fills") or []
+                     sorted_fills = sorted(fills, key=lambda x: x.get("trade_time", "") if isinstance(x, dict) else "")
+                     adopted = 0
+                     for f in sorted_fills:
+                         try:
+-                            if f.get("side") != "BUY": continue
++                            if self._get_side(f) != "BUY": 
++                                continue
+                             p = Decimal(str(f.get("price")))
+                             s = Decimal(str(f.get("size")))
+                         except Exception:
+@@ -83,12 +98,21 @@ class CoinbaseOrderManager:
+                     logger.error("[%s] Ledger priming failed: %s", pid[:8], e, exc_info=True)
+ 
+     async def sync_active_orders(self):
++        """Watchdog background synchronization method to reconcile local cache with exchange state."""
+         for pid, client in self.clients.items():
+             if pid == self.profits_portfolio_id:
+                 continue
+             try:
+-                endpoint = "/api/v3/brokerage/orders/historical/batch?order_status=OPEN&limit=1000"
+-                resp = await safe_api_call(client, "GET", endpoint)
++                endpoint = "/api/v3/brokerage/orders/historical/batch"
++                
++                # FIX 1: Pass order_status as a LIST to force strict API filtering
++                # FIX 2: Pass via payload dictionary so the SDK signs the URL hash correctly
++                params = {
++                    "order_status": ["OPEN", "PENDING"], 
++                    "limit": 1000
++                }
++                
++                resp = await safe_api_call(client, "GET", endpoint, payload=params)
+                 if not resp.get("success"):
+                     continue
+                     
+@@ -97,7 +121,10 @@ class CoinbaseOrderManager:
+                 
+                 for order in orders_list:
+                     cid = order.get("client_order_id")
+-                    if cid and order.get("status") == "OPEN":
++                    
++                    # FIX 3: Strict Local Filter. 
++                    # Never trust the API's filtering; always verify the status manually.
++                    if cid and order.get("status", "").upper() in ["OPEN", "PENDING"]:
+                         exchange_open_client_ids.add(cid)
+                         temp_id = f"local_{cid}"
+                         if temp_id not in self.active_orders:
+@@ -105,7 +132,7 @@ class CoinbaseOrderManager:
+                             limit_config = order_config.get("limit_limit_gtc", {}) or order_config.get("limit_limit_gtd", {})
+                             self.active_orders[temp_id] = {
+                                 "client_order_id": cid, "portfolio_id": pid, "product_id": order.get("product_id"),
+-                                "side": order.get("side", "UNKNOWN").upper(), "price": limit_config.get("limit_price", "0"),
++                                "side": self._get_side(order), "price": limit_config.get("limit_price", "0"),
+                                 "status": "OPEN", "exchange_id": order.get("order_id")
+                             }
+ 
+@@ -130,6 +157,7 @@ class CoinbaseOrderManager:
+                 logger.error("Error reconciling portfolio %s: %s", pid[:8], e)
+                 
+     async def skim_dust(self):
++        """Scans multi-tenant sub-accounts for marginal dust balances and sweeps to profits portfolio."""
+         logger.info("Scanning portfolios for dust to skim...")
+         DUST_THRESHOLD = Decimal("1.00")
+         STABLECOIN_EXCLUSIONS = {"USDC", "USDT"}
+@@ -170,7 +198,9 @@ class CoinbaseOrderManager:
+                 logger.error("[%s] Dust skimming fault: %s", pid[:8], e)
+ 
+     async def add_buy_to_ledger(self, portfolio_id: str, price: str, size: str):
+-        async with self.ledger_lock:
++        """Appends confirmed buy allocations into the portfolio's queue tracking cost-basis."""
++        self._ensure_lock(portfolio_id)
++        async with self.ledger_locks[portfolio_id]:
+             try:
+                 p = Decimal(str(price))
+                 s = Decimal(str(size))
+@@ -191,10 +221,12 @@ class CoinbaseOrderManager:
+             logger.error("[%s] Failed to queue PnL to DB: %s", portfolio_id[:8], e)
+ 
+     async def calculate_and_sweep(self, portfolio_id: str, sell_price: str, sell_size: str, client_order_id: str = None, exchange_id: str = None):
++        """Calculates realized profit metrics using FIFO inventory accounting structures."""
+         if portfolio_id not in self.cost_basis_ledger:
+             self.cost_basis_ledger[portfolio_id] = deque()
+-
+-        async with self.ledger_lock:
++            
++        self._ensure_lock(portfolio_id)
++        async with self.ledger_locks[portfolio_id]:
+             try:
+                 if not self.cost_basis_ledger[portfolio_id]:
+                     return
+@@ -240,26 +272,35 @@ class CoinbaseOrderManager:
+                     logger.info("💰 [PnL] Logged realized profit for %s: $%s", portfolio_id[:8], realized_usdc)
+ 
+             except Exception as e:
+-                logger.error("❌ FATAL ERROR IN calculate_and_sweep for %s: %s", portfolio_id, e)
++                logger.error("❌ FATAL ERROR IN calculate_and_sweep for %s: %s", portfolio_id, e, exc_info=True)
+ 
+     async def _cleanup_terminal_order(self, client_order_id: str):
+         if not client_order_id: return
+         
+         if client_order_id not in self.terminal_order_cache:
+-            self.terminal_order_cache.append(client_order_id)
++            self.terminal_order_cache[client_order_id] = True
++            if len(self.terminal_order_cache) > self.CACHE_MAX_SIZE:
++                self.terminal_order_cache.popitem(last=False)
+ 
+         local_key = f"local_{client_order_id}"
+         self.active_orders.pop(local_key, None)
+         
+         async with self._queue_lock:
+-            new_queue = deque()
++            # Purge structural mutations from priority queue
++            new_priority = deque()
++            for task in self.priority_queue:
++                if task.get("client_order_id") != client_order_id:
++                    new_priority.append(task)
++            self.priority_queue = new_priority
++            
++            # Purge structural mutations from standard queue
++            new_standard = deque()
+             for task in self.execution_queue:
+                 if task.get("client_order_id") != client_order_id:
+-                    new_queue.append(task)
+-            self.execution_queue = new_queue
++                    new_standard.append(task)
++            self.execution_queue = new_standard
+ 
+     def on_user_message(self, message):
+-        import json
+         logger.info(f"⚡ RAW WS PAYLOAD: {str(message)[:250]}")
+         
+         try:
+@@ -271,7 +312,6 @@ class CoinbaseOrderManager:
+         for event in events:
+             orders = event.get("orders", []) if isinstance(event, dict) else []
+             for order in orders:
+-                logger.info("DEBUG_ORDER_EVENT: ID=%s Status=%s", order.get("client_order_id"), order.get("status"))
+                 try:
+                     status = order.get("status", "").upper()
+                     client_order_id = order.get("client_order_id")
+@@ -288,9 +328,8 @@ class CoinbaseOrderManager:
+                     
+                     if client_order_id in self.processed_fills:
+                         continue
+-                    self.processed_fills.add(client_order_id)
+                     
+-                    side = order.get("order_side", "").upper() 
++                    side = self._get_side(order)
+                     price = order.get("avg_price") or order.get("limit_price", "0")
+                     size = order.get("cumulative_quantity", "0")
+                     pid = order.get("retail_portfolio_id") 
+@@ -299,6 +338,8 @@ class CoinbaseOrderManager:
+                     if not client_order_id or not side or not pid:
+                         continue
+                         
++                    self.processed_fills.add(client_order_id)
++                        
+                     if self.loop and self.loop.is_running():
+                         if side == "BUY":
+                             asyncio.run_coroutine_threadsafe(self.add_buy_to_ledger(pid, price, size), self.loop)
+@@ -329,6 +370,11 @@ class CoinbaseOrderManager:
+     async def drain_execution_queue(self, limit: int = 20) -> list:
+         batch = []
+         async with self._queue_lock:
++            # Drain prioritized structural parameters first
++            while self.priority_queue and len(batch) < limit:
++                batch.append(self.priority_queue.popleft())
++                
++            # Fill out execution bandwidth with standard placements
+             while self.execution_queue and len(batch) < limit:
+                 batch.append(self.execution_queue.popleft())
+         return batch
+\ No newline at end of file
+-- 
+2.55.0.windows.2
+
